@@ -1,0 +1,546 @@
+# SmartWhale 设计文档
+
+> 一个基于**无头 Minecraft 客户端**、由 **LLM 自主驱动**的 Minecraft 机器人。
+> 目标平台：Minecraft 1.21.1 + NeoForge（21.1.x），支持 mod。
+
+## 1. 目标与非目标
+
+### 目标
+
+- **真客户端**：运行真实的 NeoForge 客户端（去掉渲染），因此能加入装有任意 mod 的服务器，并且 mod 的客户端逻辑、注册表同步、自定义网络包都正常工作。
+- **完全自主**：机器人自己决定玩什么、怎么玩，不依赖外部给定的目标。
+- **社交**：通过游戏内聊天与其他玩家交流。其他玩家的话属于社交输入，不是指令，机器人可以回应、合作，也可以忽略。
+- **自管记忆**：由模型通过工具读写自己的记忆文件，并自己决定加载哪些内容。
+- **认证**：支持 authlib-injector 外置登录服务器。
+
+### 非目标（当前阶段）
+
+- 多 bot 协调。一个 Node 进程只对应一个 bot，想多开就由用户自己启动多个 node 进程。
+- 代码生成和技能库（Voyager 风格）。只采用纯工具调用。
+- 视觉输入（截图）。
+- 正版（微软）认证、离线认证。架构上不排斥，以后再做。
+
+## 2. 总体架构
+
+```mermaid
+flowchart LR
+  subgraph Node["agent/ (TypeScript, Node)"]
+    Sup[Launcher / Supervisor<br/>Yggdrasil 认证 · 实例准备 · HeadlessMC 子进程]
+    Loop[Agent Loop<br/>自主循环 · 上下文管理]
+    LLM[LLM Client<br/>OpenAI 兼容 /chat/completions]
+    Tools[Tool Registry<br/>游戏工具 · 记忆工具 · 控制工具]
+    Mem[(data/&lt;bot&gt;/memory/)]
+    RPC[Bridge RPC Client]
+    Loop --> LLM
+    Loop --> Tools
+    Tools --> RPC
+    Tools --> Mem
+  end
+  subgraph MC["无头 NeoForge 1.21.1 客户端 (JDK21)"]
+    Bridge[bridge/ mod<br/>WS JSON-RPC 服务端]
+    Bar[Baritone]
+    Mods[玩法 mod]
+    Bridge --> Bar
+    Bridge --> Mods
+  end
+  Sup -->|启动 / 守护 / 重启| MC
+  RPC <-->|ws://127.0.0.1:port<br/>JSON-RPC 2.0| Bridge
+  MC <-->|游戏协议 + authlib-injector| Server[(MC 服务器)]
+  Sup -->|authserver| Ygg[(Yggdrasil 认证服务器)]
+  LLM --> API[(LLM API)]
+```
+
+两个进程各自负责：
+
+| 组件 | 语言 | 职责 |
+|---|---|---|
+| `bridge/` | Java 21, NeoForge mod | 感知世界、执行动作、封装 Baritone、查询注册表和配方、推送事件。**不含任何 LLM 逻辑。** |
+| `agent/` | TypeScript, Node ≥ 22 | 启动和守护 MC、认证、Agent 循环、LLM 调用、工具定义、记忆、上下文管理、日志。 |
+
+这样拆分的理由：迭代 agent 时不用重启 MC；任一进程崩溃都不会连带另一个；LLM 生态主要在 JS/TS 这边。
+
+## 3. 目录结构
+
+```text
+SmartWhale/
+├─ docs/
+│  └─ DESIGN.md
+├─ bridge/                       # NeoForge mod (ModDevGradle)
+│  ├─ build.gradle
+│  ├─ settings.gradle
+│  ├─ gradle.properties
+│  └─ src/main/
+│     ├─ java/dev/smartwhale/bridge/
+│     │  ├─ SmartWhaleBridge.java        # @Mod 入口
+│     │  ├─ server/                      # Netty WebSocket 服务端、鉴权、JSON-RPC 分发
+│     │  ├─ rpc/                         # 方法注册表、参数/结果 DTO、错误码
+│     │  ├─ observe/                     # 状态、背包、方块、实体、界面
+│     │  ├─ knowledge/                   # 注册表、配方、物品信息
+│     │  ├─ action/                      # 瞬时动作（看、交互、攻击、放置、聊天…）
+│     │  ├─ menu/                        # 通用容器 / mod GUI 操作、合成
+│     │  ├─ task/                        # 长任务管理 + Baritone 适配
+│     │  ├─ event/                       # 游戏事件 → JSON-RPC 通知
+│     │  └─ compat/                      # 可选 mod 集成（按 ModList 条件加载）
+│     │     ├─ jei/                      # @JeiPlugin、RecipeSource、配方转移
+│     │     └─ tacz/                     # 枪械操作与状态
+│     └─ resources/META-INF/neoforge.mods.toml
+├─ agent/                        # Node / TypeScript
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  └─ src/
+│     ├─ main.ts                         # CLI 入口：smartwhale run <config>
+│     ├─ config/                         # 配置 schema (zod) 与加载
+│     ├─ launcher/                       # 实例准备、Yggdrasil、HeadlessMC 子进程
+│     ├─ bridge/                         # WS JSON-RPC 客户端、事件流、协议类型
+│     ├─ llm/                            # OpenAI 兼容客户端、重试、计费
+│     ├─ tools/                          # 工具定义（zod schema → JSON Schema）
+│     │  ├─ game/                        # 映射到 bridge 方法
+│     │  ├─ memory/                      # 文件系统记忆工具
+│     │  └─ control/                     # wait 等控制工具
+│     ├─ agent/                          # 主循环、提示词、上下文压缩、事件调度
+│     └─ util/
+├─ config/
+│  └─ bot.example.json                   # 配置示例（真实配置不入库）
+├─ run/<bot>/                            # bot 游戏目录（gitignore）
+└─ data/<bot>/                           # bot 数据（gitignore）
+   ├─ memory/                            # 模型自管记忆
+   ├─ auth.json                          # 缓存的 Yggdrasil token
+   └─ logs/                              # 对话转录 JSONL、bridge 日志
+```
+
+## 4. 运行时与启动
+
+### 4.1 游戏实例
+
+- **共享**：`D:\.minecraft` 下的 `libraries/`、`assets/`、`versions/1.21.1-NeoForge/`（NeoForge 21.1.252）。
+- **独立游戏目录**：`run/<bot>/`。由 launcher 在每次启动前完成同步：
+  - `mods/`：按配置从源实例（`D:\.minecraft\versions\1.21.1-NeoForge\mods`）复制，再加上 `smartwhale-bridge` 和 Baritone。
+  - `options.txt`：写入适合 bot 的值，例如 `renderDistance=8`、`pauseOnLostFocus=false`、音量全部为 0、`onboardAccessibility=false`、`skipMultiplayerWarning=true`。
+  - `config/`：按需从源实例复制 mod 配置。
+- **Mod 分类**（按源实例当前列表初步划分）：
+
+  | 处理方式 | Mod |
+  |---|---|
+  | 去掉（渲染） | sodium, iris |
+  | 去掉（纯客户端 UI） | BetterF3, mobhealthbar, appleskin |
+  | 保留（bot 功能依赖） | jei 及其依赖 mezz_config(_gui)，用于读取配方和配方转移，见 §6.3 knowledge.* |
+  | 保留（玩法 / 需与服务端一致） | FarmersDelight, sophisticatedbackpacks/core, curios, caelus, elytraslot, Gobber, guardvillagers(+tacz support), tacz, ysm, solcarrot, attributefix 以及它们的依赖库（architectury, bookshelf, cloth-config, geckolib, prickle） |
+
+  YSM 和 TACZ 已经在更小规模的项目里实测过，无头模式下可以工作。
+
+  配置里用 `mods.include` / `mods.exclude` 的 glob 来表达，不硬编码。
+
+### 4.2 无头化
+
+使用 [HeadlessMC](https://github.com/headlesshq/headlessmc) 作为启动器。它的 `-lwjgl` 模式会在字节码层面把 LWJGL 的 GLFW/OpenGL/OpenAL 调用替换为空实现，客户端照常 tick，但不创建窗口，也不渲染。
+
+- Java：`D:\Applications\JDK21\bin\java.exe`。
+- 在 `run/<bot>/HeadlessMC/config.properties` 中指定 mc 目录、游戏目录和 Java 路径。
+- 启动时附加的 JVM 参数：
+  - `-javaagent:<authlib-injector.jar>=<yggdrasil API URL>`
+  - `-Dsmartwhale.bridge.port=<port>`、`-Dsmartwhale.bridge.token=<随机 secret>`
+- 启动后直接进服，使用 `--quickPlayMultiplayer <host:port>`（1.20+ 原生支持）。
+- launcher 接管 HeadlessMC 子进程的 stdout/stderr 并写入日志；进程退出时按退避策略重启。
+
+> ⚠️ **风险 R1**：HeadlessMC 能否接收外部传入的 `accessToken/uuid/username`。如果不能，退回方案是由 `agent/launcher` 自己解析 version json、拼 classpath 和参数，只借用 `headlessmc-lwjgl` 做 patch。
+
+### 4.3 认证（authlib-injector）
+
+由 `agent/launcher/yggdrasil.ts` 实现：
+
+1. 读取 `data/<bot>/auth.json`。如果有缓存 token，先调用 `POST {api}/authserver/validate` 检查，失效则调用 `/refresh`。
+2. 没有缓存或刷新失败时，调用 `POST {api}/authserver/authenticate`：`{ username, password, clientToken, agent: { name: "Minecraft", version: 1 } }`，拿到 `accessToken` 和 `selectedProfile { id, name }`。
+3. 密码只从环境变量读取（`SMARTWHALE_AUTH_PASSWORD`），不写入配置文件和日志。
+4. 预取 API 元数据，通过 `-Dauthlibinjector.yggdrasil.prefetched=<base64>` 传入，免去 agent 启动时的一次网络请求。
+5. 游戏参数：`--username <name> --uuid <id> --accessToken <token> --userType mojang`。
+
+## 5. Bridge mod 设计
+
+### 5.1 技术选择
+
+- 构建：ModDevGradle，NeoForge 21.1.252，Parchment mappings，Java 21。
+- WebSocket：直接使用 MC 自带的 **Netty**（`HttpServerCodec` + `WebSocketServerProtocolHandler`），不引入额外依赖，也不需要 jar-in-jar。
+- JSON：使用 MC 自带的 Gson。
+- Baritone：以 `baritone-api-neoforge-1.11.2` 作为编译依赖，运行时把 standalone jar 放进 `mods/`。
+- 只在客户端加载（`neoforge.mods.toml` 中 `side = "CLIENT"`）。
+
+### 5.2 线程模型
+
+- Netty IO 线程负责接收请求、解析 JSON-RPC。
+- **所有涉及游戏状态的读写**都通过 `Minecraft.getInstance().submit(...)` 投递到客户端主线程执行，再把结果带回 IO 线程写出。
+- 长任务（寻路、挖矿等）由 `TaskManager` 在客户端 tick 事件里推进，结束时发出通知。
+- 每个请求有超时（默认 10s），超时返回错误，不阻塞主线程。
+
+### 5.3 安全
+
+- 只监听 `127.0.0.1`。
+- 连接后必须先调用 `bridge.hello` 并带上 token，否则断开。
+- 同一时刻只允许一个 agent 连接；新连接会踢掉旧连接，以便 agent 重启后重连。
+- 端口和 token 优先读取系统属性 `smartwhale.bridge.port` / `smartwhale.bridge.token`。如果都没有设置，则读取 `<gameDir>/config/smartwhale-bridge.toml`，用于 attach 模式，见 §7.8。
+
+### 5.4 Baritone 配置
+
+由 bridge 在启动时写入：
+
+- `chatControl=false`、`prefixControl=false`，防止聊天内容触发 Baritone 命令。
+- `allowBreak=true`、`allowPlace=true`、`allowParkour=false`、`allowSprint=true`。
+- `freeLook=false`、`antiCheatCompatibility=true`，尽量模拟正常玩家。
+- `acceptableThrowawayItems` 以泥土、圆石为主，可通过 RPC 调整。
+
+## 6. 通信协议（WebSocket + JSON-RPC 2.0）
+
+### 6.1 约定
+
+- 地址：`ws://127.0.0.1:<port>/rpc`，一帧对应一个 JSON-RPC 消息，不使用批量请求。
+- 方法名采用 `namespace.verb` 形式，参数和结果都是对象，字段用 `snake_case`。
+- 坐标：方块坐标为 `{ "x": int, "y": int, "z": int }`，实体位置为 double。
+- 物品和方块用注册表 id 表示（如 `minecraft:oak_log`、`farmersdelight:cabbage`）。需要多个时可以用 tag（`#minecraft:logs`）。
+- 时间以 tick 为单位，另外附带人类可读的字段。
+
+### 6.2 错误码
+
+| code | 含义 |
+|---|---|
+| -32600 ~ -32603 | JSON-RPC 标准错误 |
+| 1001 | `NOT_IN_WORLD`：未进入世界 |
+| 1002 | `TIMEOUT` |
+| 1003 | `INVALID_TARGET`：方块、实体或槽位不存在，或超出距离 |
+| 1004 | `NO_RECIPE` / `MISSING_INGREDIENTS` |
+| 1005 | `NO_MENU`：当前没有打开对应界面 |
+| 1006 | `TASK_BUSY`：已有互斥任务在运行 |
+| 1007 | `UNAUTHORIZED` |
+
+`error.data` 里带 `hint` 字段，给 LLM 一条可执行的建议，例如 `"需要工作台，附近 32 格内未找到"`。
+
+### 6.3 方法清单
+
+#### bridge.*
+
+| 方法 | 说明 |
+|---|---|
+| `bridge.hello { token, protocol }` | 鉴权和协议版本协商，返回 bridge 版本、MC/NeoForge 版本、已加载 mod 列表、能力列表 |
+| `bridge.ping` | 心跳 |
+
+#### observe.*（只读）
+
+| 方法 | 说明 |
+|---|---|
+| `observe.status` | 名字、维度、坐标、朝向、生命/最大生命、饥饿/饱和、经验、护甲、状态效果、主手/副手物品、是否着火/在水中/在地面、群系、光照、游戏时间（含昼夜）、天气、当前任务 |
+| `observe.inventory` | 背包、快捷栏（标出选中槽位）、护甲栏、副手；如果有 Curios 槽位也一并列出 |
+| `observe.blocks { radius, filter?, mode }` | 周围方块概览：`mode=summary` 返回各类方块的计数和最近坐标，`mode=list` 返回坐标列表（有上限） |
+| `observe.find_blocks { ids/tags, radius, limit }` | 查找最近的指定方块。受**感知模式**约束（见下文） |
+| `observe.block { pos }` | 方块 id、blockstate 属性、是否有方块实体，以及容器内容（如果已缓存） |
+| `observe.entities { radius, filter? }` | 附近实体：类型、名字、距离、坐标、生命值，以及是否敌对、是否玩家 |
+| `observe.players` | 在线玩家列表（tab 列表），并标出附近的玩家 |
+| `observe.screen` | 当前打开的界面：menu 类型 id、标题、槽位（index、物品、数量、属于容器还是玩家背包）、可点击控件（index、文字、类型）、进度条类数据（ContainerData） |
+
+**感知模式**（配置项 `agent.perception`，默认 `visible`）：
+
+- `visible`：`observe.blocks` 和 `observe.find_blocks` 只返回至少有一面接触空气、水或其他透明方块的方块，同时还要求与 bot 眼睛之间的射线无遮挡，或在 4 格内。效果接近真人，矿石要靠自己去找、去挖。
+- `omniscient`：返回客户端已加载区块中的所有匹配方块，相当于矿透。
+- `task.mine` 和 `task.goto_block` 依赖 Baritone 的方块搜索，所以在 `visible` 模式下要配置 Baritone 的 `legitMine=true`，让它只挖看得见的矿。
+
+#### knowledge.*（只读，客户端本地）
+
+配方数据有两个来源，统一由 `knowledge/RecipeSource` 抽象：
+
+1. **JEI（首选，`compat/jei/`）**：通过 `@JeiPlugin` 的 `onRuntimeAvailable` 拿到 `IJeiRuntime`。它的优势是：
+   - 覆盖所有向 JEI 注册了配方类别的 mod，包括不走原版 `RecipeManager` 的配方，以及 JEI 中的"虚拟"配方，比如 Farmer's Delight 的砧板/厨锅、各种机器配方、交易、堆肥。
+   - 有 **catalyst**，即每类配方用什么方块或机器完成，这正是 LLM 规划时最需要的信息。
+   - 提供 `jei:information` 信息页（mod 作者写的物品获取说明），以及 fluid 等非物品原料。
+   - 提供配方转移（见 `menu.jei_transfer`）。
+
+   查询时使用 `IRecipeManager.createRecipeLookup(type).limitFocus(focus)` 和 `getRecipeIngredients(category, recipe)`，后者按 `INPUT / OUTPUT / CATALYST` 区分原料，不需要构建 GUI 布局。只有执行转移时才调用 `createRecipeLayoutDrawable` 拿 `IRecipeSlotsView`。
+2. **原版 `RecipeManager`（兜底）**：JEI 未加载或未就绪时使用。1.21.1 中服务端会把全部配方同步到客户端。
+
+**配方引用**：所有返回的配方都带 `recipe_ref`，格式为 `"<category_uid>|<recipe_id 或稳定哈希>"`。有 `RecipeHolder` 的配方使用它的 id；JEI 的虚拟配方使用"类别 + 输入输出"计算出的哈希。bridge 维护会话级缓存，用于把 `recipe_ref` 映射回配方对象，供后续 `knowledge.recipe` 和 `menu.jei_transfer` 使用。
+
+**原料表示**：每个原料槽位是一组候选项（用 tag 表示时给出 tag 名和前几个候选物品），附带数量、类型（item / fluid / 其他）以及 `slot_name`（如果有）。结果会标出背包里已经有多少。
+
+| 方法 | 说明 |
+|---|---|
+| `knowledge.search { query, kind: item\|block\|entity\|fluid, limit }` | 按 id、本地化名、mod 名模糊搜索。JEI 可用时使用 `IIngredientFilter`，支持 `@mod`、`#tag` 语法 |
+| `knowledge.item { id }` | 物品信息：名字、tooltip、最大堆叠、耐久、食物属性、所属 tag，以及 JEI 信息页文本（如果有） |
+| `knowledge.categories { mod? }` | 列出配方类别：uid、显示名、所属 mod、catalyst（即对应的工作站或机器） |
+| `knowledge.recipes { item, role: output\|input\|catalyst, category?, limit, offset }` | `output` 表示怎么做出这个物品，`input` 表示这个物品能用来做什么，`catalyst` 表示这台机器能做什么。结果按类别分组，每条包含 `recipe_ref`、输入、输出（含概率产出）、catalyst，以及类别能提供的额外信息（耗时、经验、能量等，从配方对象尽量提取） |
+| `knowledge.recipe { recipe_ref }` | 单条配方的完整信息，并给出"能否用 `menu.jei_transfer` 转移到当前界面"的判断 |
+| `knowledge.plan { item, count, max_depth? }` | **合成规划**：结合当前背包，递归展开配方树。优先选择原版合成、熔炼，以及已有 catalyst 的类别；可以用 `prefer_categories` 指定偏好。返回按依赖排好顺序的步骤（每步写明 recipe_ref、所需工作站、次数），以及还缺哪些"原材料"（找不到配方，或只能靠采集获得的物品）。遇到循环配方（如锭和块互转）会剪枝 |
+
+#### action.*（瞬时动作，同步返回结果）
+
+| 方法 | 说明 |
+|---|---|
+| `action.chat { message }` | 发送聊天。`/` 开头的命令只允许白名单内的（`/msg`、`/tell`、`/r`、`/me`） |
+| `action.look { pos \| entity_id \| yaw,pitch }` | 转向 |
+| `action.select_hotbar { slot }` | 选择快捷栏槽位 |
+| `action.equip { item, slot: mainhand\|offhand\|head\|... }` | 把背包中的物品装备到指定位置 |
+| `action.drop { item?, slot?, count }` | 丢弃物品 |
+| `action.use_item { hand, duration_ticks? }` | 右键使用物品（吃东西、拉弓、使用 mod 物品），支持持续按住 |
+| `action.interact_block { pos, face? }` | 右键方块（开门、开箱、操作 mod 机器）；需要时自动转向，超出触及距离时报错 |
+| `action.break_block { pos }` | 挖掉单个可触及的方块（Baritone 之外的精细操作） |
+| `action.place_block { item, pos, face? }` | 在指定位置放置方块 |
+| `action.interact_entity { entity_id }` | 右键实体（交易、骑乘、喂养） |
+| `action.attack { entity_id }` | 攻击一次，会考虑攻击冷却 |
+| `action.respawn` | 死亡后重生 |
+
+#### menu.*（通用界面操作，可覆盖 mod GUI）
+
+| 方法 | 说明 |
+|---|---|
+| `menu.click { slot, button, click_type }` | 底层槽位点击（PICKUP / QUICK_MOVE / SWAP / THROW / PICKUP_ALL） |
+| `menu.transfer { item, count, to: container\|player }` | 高层操作：在容器和背包之间搬运物品 |
+| `menu.click_widget { index }` | 点击界面上的按钮控件（用于 mod GUI），控件来自 `observe.screen` |
+| `menu.craft { item \| recipe_ref, count }` | 合成：自动找配方。2x2 用背包合成格，3x3 需要已打开工作台。优先使用 JEI 转移，否则用原版 `handlePlaceRecipe` 摆好原料，然后 shift 点击取出。会循环执行直到达到 count 或原料耗尽 |
+| `menu.jei_transfer { recipe_ref, max?: bool }` | 对**当前打开的界面**执行 JEI 配方转移，相当于点击 JEI 的"+"按钮。适用于所有为 JEI 注册了 `IRecipeTransferHandler` 的 mod 机器和工作台。会先调用 `transferRecipe(..., doTransfer=false)` 检查，失败时返回 JEI 给出的错误（例如缺少原料、界面不匹配），作为 hint。转移后如何取出产物（产物槽、等待加工）由模型通过 `observe.screen` 和 `menu.click` 或 `menu.transfer` 完成 |
+| `menu.close` | 关闭当前界面 |
+
+#### task.*（长任务，异步完成）
+
+`task.*` 的启动方法立即返回 `{ task_id }`。任务完成时推送 `event.task_finished` 或 `event.task_failed`。同一时刻只能运行一个移动类任务，启动新任务会自动取消旧任务。
+
+| 方法 | Baritone 映射 | 说明 |
+|---|---|---|
+| `task.goto { pos \| xz \| y, range? }` | `CustomGoalProcess` + `GoalBlock`/`GoalXZ`/`GoalNear` | 前往目标位置 |
+| `task.goto_block { ids/tags }` | `GetToBlockProcess` | 走到最近的某类方块旁 |
+| `task.mine { ids/tags, count }` | `MineProcess` | 挖到背包里有 count 个为止 |
+| `task.follow { entity_id \| player }` | `FollowProcess` | 跟随，直到被取消 |
+| `task.explore { origin? }` | `ExploreProcess` | 向未探索区块移动 |
+| `task.farm { range }` | `FarmProcess` | 收获并重新种植作物 |
+| `task.collect_items { radius }` | 自定义 | 捡起附近掉落物 |
+| `task.status` | — | 当前任务和进度 |
+| `task.cancel` | `cancelEverything` | 取消当前任务 |
+
+任务有超时（可配置，默认 5 分钟）。另外有"卡住检测"：位置长时间不变化且 Baritone 无进展时，直接判定失败，`reason=stuck`。
+
+#### tacz.*（可选模块，仅在 `tacz` 已加载时注册）
+
+TACZ 的枪械既不走原版 `attack`，也不走 `use_item`，而是由客户端直接调用 `IClientPlayerGunOperator`，再由 TACZ 自己发网络包。所以需要专门的工具。
+
+- **实现**：放在 bridge 的 `compat/tacz/` 包中，以 `compileOnly` 依赖 TACZ jar。只有 `ModList.isLoaded("tacz")` 为真时才加载这个包里的类并注册方法，未安装 TACZ 时不会触发类加载。`bridge.hello` 的能力列表里会包含 `tacz`。
+- **入口**：`IClientPlayerGunOperator.fromLocalPlayer(player)` 负责操作，`IGun.getIGunOrNull(stack)` 负责读取枪械状态。
+- **开火节奏**：由 bridge 在客户端 tick 里驱动，每个 tick 调用 `shoot()` 并根据返回的 `ShootResult` 处理：`COOL_DOWN` 继续等待，`NEED_BOLT` 自动调用 `bolt()`，`NO_AMMO` 按参数决定是否自动 `reload()`，其他失败直接结束并带上原因。
+
+| 方法 | 说明 |
+|---|---|
+| `tacz.gun_info { slot? }` | 默认读取主手，也可以指定槽位。返回枪械 id 和显示名、当前弹药/弹匣容量、膛内是否有弹、射击模式（AUTO/SEMI/BURST）、RPM、背包中是否有可用弹药、热量/是否过热锁定、是否正在瞄准/换弹/拉栓/切枪、是否可以趴下 |
+| `tacz.aim { on }` | 开镜或关镜 |
+| `tacz.reload` | 换弹；完成后推送 `event.tacz_reloaded` |
+| `tacz.bolt` | 手动拉栓 |
+| `tacz.fire_select` | 切换射击模式，返回新模式 |
+| `tacz.melee` | 枪械近战（刺刀、枪托） |
+| `tacz.crawl { on }` | 趴下或起身 |
+| `tacz.shoot { target: entity_id \| pos, shots?, max_ticks?, aim?, auto_reload? }` | **短时同步动作**：持续瞄准目标（实体按 `getEyePosition` 计算，暂不做弹道下坠和提前量），按节奏开火，直到打完 `shots` 发、达到 `max_ticks`、目标死亡或丢失，或出现不可恢复的 `ShootResult` 为止。返回已开火数、各类 `ShootResult` 的计数、结束原因、剩余弹药 |
+| `tacz.charge { target, release_at? }` | 蓄力武器：`chargeShoot(true)`，达到指定进度后释放 |
+| `task.tacz_engage { entity_id, max_seconds?, keep_distance? }` | **长任务**：持续交战。目标可见时开火，弹药耗尽时换弹，可选用 Baritone 保持距离。目标死亡、丢失或超时后结束，推送 `event.task_finished` 或 `event.task_failed` |
+
+相关事件：`event.tacz_reloaded`；`event.tacz_hit { target, damage, headshot, killed }`，前提是能在客户端拿到命中反馈，`EntityHurtByGunEvent` 和 `EntityKillByGunEvent` 在客户端是否会触发需要在 M0 实测，拿不到就退化为监听目标的生命值变化。
+
+工具提示词要说明：持有枪械时用 `tacz_*` 战斗，不要用 `action_attack`；开火前先 `tacz_gun_info` 看弹药。
+
+### 6.4 事件（服务端 → 客户端通知）
+
+| 通知 | 字段 | 紧急 |
+|---|---|---|
+| `event.chat` | `sender`、`sender_uuid?`、`message`、`kind: player\|system\|whisper`、`distance?`、`mentions_me` | 提到 bot 或私聊时为是 |
+| `event.hurt` | `amount`、`health`、`source?`、`attacker?` | 是 |
+| `event.death` | `message`、`pos` | 是 |
+| `event.respawned` | `pos` | — |
+| `event.task_finished` | `task_id`、`summary` | 是 |
+| `event.task_failed` | `task_id`、`reason`、`hint` | 是 |
+| `event.item_picked` | `item`、`count` | — |
+| `event.screen_opened` / `event.screen_closed` | `menu_type`、`title` | — |
+| `event.player_joined` / `event.player_left` | `name` | — |
+| `event.time` | `phase: dawn\|dusk` | — |
+| `event.disconnected` | `reason` | 是 |
+| `event.world_ready` | `server`、`dimension` | 是 |
+
+为了避免事件刷屏，同类低优先级事件会在 bridge 端合并（例如 1 秒内的多次拾取合成一条）。
+
+## 7. Agent 设计
+
+### 7.1 LLM 客户端
+
+- 自己封装 OpenAI 兼容的 `POST {baseURL}/chat/completions`，包括 `tools`、`tool_choice`、`parallel_tool_calls`，不依赖 SDK。
+- 配置项：`baseURL`、`model`、`apiKey`（从环境变量读取）、`temperature`、`max_tokens`、`context_window`。
+- 重试：对 429 和 5xx 做指数退避；工具调用参数不是合法 JSON 时，把错误作为工具结果回传给模型，让它自己修正。
+- 计费：记录每次调用的 token 用量。可配置每分钟调用上限和每日 token 预算，超出后进入低频模式。
+
+### 7.2 工具
+
+所有工具用 zod 定义，再转成 JSON Schema 提供给 LLM。工具分三类：
+
+1. **游戏工具**：基本一一对应 §6.3 的方法（不暴露 `bridge.*`），名称用下划线风格，如 `observe_status`、`task_mine`、`menu_craft`。返回结果是**精简过的文本或 JSON**，超过 4k 字符会截断，并提示用过滤参数缩小范围。
+2. **记忆工具**：见 §7.4。
+3. **控制工具**：
+   - `wait { seconds, until?: "task" | "event" }`：暂停思考，直到超时、当前任务结束或紧急事件到来，返回期间收到的事件摘要。这是 agent 节省 token 的主要手段。
+
+工具执行失败（bridge 错误、超时）时，不抛异常，而是作为工具结果返回 `{ error, hint }`。
+
+### 7.3 主循环
+
+```mermaid
+stateDiagram-v2
+  [*] --> Booting
+  Booting --> Thinking: world_ready
+  Thinking --> Acting: 模型返回 tool_calls
+  Acting --> Thinking: 工具结果追加到上下文
+  Thinking --> Idle: 模型不调用工具（结束本轮）
+  Acting --> Waiting: 调用 wait
+  Waiting --> Thinking: 超时 / 任务结束 / 紧急事件
+  Idle --> Thinking: 心跳(默认 30s) / 紧急事件
+  Thinking --> Compacting: 上下文超阈值
+  Compacting --> Thinking
+  Thinking --> Booting: disconnected
+```
+
+- **每轮开头**：自动注入一条简短的 `[状态]` 用户消息，包含坐标、生命、饥饿、时间、当前任务，以及自上一轮以来的事件。这样模型不用每轮都调 `observe_status`。
+- **事件调度**：紧急事件（§6.4）会立即唤醒 `Waiting` 和 `Idle` 状态；其余事件进入队列，在下一轮统一注入。
+- **聊天限流**：同一时间间隔内的发言条数和每分钟发言总数都有上限，超长消息自动切分（MC 单条上限 256 字符），并忽略自己发出的消息。超过限流时，`action_chat` 返回错误，让模型自己调整。
+- **断线**：断线时进入 `Booting`，由 supervisor 重连或重启 MC。
+- **死亡**：`event.death` 会立即唤醒模型，让它先看死亡信息、视需要把教训写进记忆，然后调用 `action_respawn`。如果超过 `agent.autoRespawnSeconds`（默认 60s）还没有重生，就由 agent 自动重生，并在下一轮注入一条说明。
+- **工具引导**：`menu_click` 等底层工具也暴露给模型，但它们的描述会写明"仅在 `menu_transfer`、`menu_craft`、`menu_click_widget` 无法完成时使用"。
+
+### 7.4 记忆：模型自管文件系统
+
+- 根目录：`data/<bot>/memory/`。这是一个沙箱，所有路径都会做规范化和越界检查，只允许文本文件，并限制单文件大小和总大小。
+- 工具：
+
+  | 工具 | 说明 |
+  |---|---|
+  | `memory_list { path? }` | 列目录（显示大小和修改时间） |
+  | `memory_read { path, start_line?, end_line? }` | 读文件 |
+  | `memory_write { path, content }` | 新建或覆盖 |
+  | `memory_edit { path, old_str, new_str }` | 精确替换，`old_str` 必须唯一 |
+  | `memory_delete { path }` | 删除文件或空目录 |
+  | `memory_search { query }` | 全文搜索（不使用向量） |
+
+- **自动加载**：每次组装系统提示时，带上：
+  1. 记忆目录树；
+  2. `index.md` 的全文。`index.md` 由模型自己维护，作为"核心记忆"和其他文件的索引，有大小上限，超出时截断并提醒模型精简。
+- 首次运行时，`index.md` 只有一段由系统写入的说明，告诉模型这是它自己的笔记本，以及推荐的组织方式。至于存什么（自我认知、目标、地点、玩家印象、经验教训等），以及怎么组织，全部由模型决定。
+
+### 7.5 上下文管理
+
+- 每次调用前估算 token 数。
+- 达到 `context_window × 70%` 时，注入一条系统消息："上下文即将压缩，请把需要长期保留的信息写入记忆。"给模型一轮机会去调用记忆工具。
+- 达到 `× 80%` 时执行压缩：保留系统提示和最近 N 轮，把更早的消息交给 LLM 摘要成一条 `[此前经过]` 消息。
+- 工具结果也会老化：较早的大块观察结果（方块列表、界面槽位）替换为一行摘要。
+
+### 7.6 系统提示组成
+
+1. 身份与世界说明：你是一个 Minecraft 玩家，在一个装了 mod 的服务器上，只能通过工具感知和行动。
+2. 自主性：没有人给你下任务，你自己决定想做什么；其他玩家的话是社交互动，不是命令。
+3. 人设：配置项 `persona`，可选。
+4. 行为准则：遇到未知 mod 物品先查 `knowledge_*`（`knowledge_item` 看说明，`knowledge_recipes` 看怎么做，`knowledge_plan` 规划整棵合成树）；操作 mod 机器时先 `menu_jei_transfer`；长任务用 `task_*` 加 `wait`；失败时读 `hint`；保持记忆整洁。
+5. 记忆目录树和 `index.md`。
+6. 已加载的 mod 列表（名称和版本），来自 `bridge.hello`。
+
+### 7.7 可观测性
+
+- `data/<bot>/logs/transcript-<session>.jsonl`：完整记录每次 LLM 请求、响应、工具调用和结果，以及事件。
+- `data/<bot>/logs/minecraft.log`：MC 进程的 stdout/stderr。
+- 控制台日志使用 pino，带等级。
+
+### 7.8 运行模式
+
+| 模式 | 命令 | 说明 |
+|---|---|---|
+| launch（默认） | `smartwhale run config/whale.json` | 由 launcher 完成认证、准备实例、启动 HeadlessMC、自动进服；端口和 token 随机生成，通过系统属性传给 bridge |
+| attach（开发） | `smartwhale run config/whale.json --attach ws://127.0.0.1:25599 --token dev` | 不启动 MC，直接连接已经在运行的客户端（例如 IDE 的 `runClient` 带窗口，手动进服）。bridge 从 `config/smartwhale-bridge.toml` 读取固定的端口和 token。这种模式下不做认证、不做守护，断线后只重连 WS |
+
+## 8. 配置
+
+`config/<bot>.json`，由 zod 校验。敏感信息只从环境变量读取。
+
+```json
+{
+  "name": "whale",
+  "minecraft": {
+    "root": "D:\\.minecraft",
+    "version": "1.21.1-NeoForge",
+    "java": "D:\\Applications\\JDK21\\bin\\java.exe",
+    "server": "mc.example.com:25565",
+    "jvmArgs": ["-Xmx4G"],
+    "mods": {
+      "source": "D:\\.minecraft\\versions\\1.21.1-NeoForge\\mods",
+      "exclude": ["sodium-*", "iris-*", "BetterF3-*", "mobhealthbar-*", "appleskin-*", "*.disabled"]
+    }
+  },
+  "auth": {
+    "type": "authlib-injector",
+    "apiRoot": "https://auth.example.com/api/yggdrasil",
+    "username": "whale@example.com",
+    "passwordEnv": "SMARTWHALE_AUTH_PASSWORD"
+  },
+  "bridge": { "port": 0 },
+  "llm": {
+    "baseURL": "https://api.example.com/v1",
+    "model": "some-model",
+    "apiKeyEnv": "SMARTWHALE_LLM_API_KEY",
+    "contextWindow": 128000,
+    "temperature": 0.7
+  },
+  "agent": {
+    "persona": "",
+    "perception": "visible",
+    "autoRespawnSeconds": 60,
+    "heartbeatSeconds": 30,
+    "chat": { "minIntervalSeconds": 3, "maxPerMinute": 10 },
+    "budget": { "maxCallsPerMinute": 20, "dailyTokens": 5000000 }
+  }
+}
+```
+
+`bridge.port = 0` 表示由 launcher 自动选一个空闲端口，并通过系统属性传给 bridge。
+
+## 9. 技术栈汇总
+
+| 部分 | 选择 |
+|---|---|
+| MC 端构建 | Gradle + ModDevGradle，Java 21（`D:\Applications\JDK21`） |
+| MC 端依赖 | NeoForge 21.1.252，Baritone API 1.11.2（neoforge），Netty / Gson（MC 自带）；TACZ 1.1.8、JEI 19.x API（均为 `compileOnly`，可选） |
+| Node 端 | Node ≥ 22，TypeScript（ESM，strict），npm |
+| Node 依赖 | `ws`、`zod`（v4，自带 JSON Schema 导出）、`pino`、`vitest`（测试）；HTTP 用原生 `fetch` |
+| 无头启动 | HeadlessMC（`-lwjgl`） |
+| 认证 | authlib-injector，Yggdrasil authserver API |
+
+## 10. 风险
+
+| # | 风险 | 应对 |
+|---|---|---|
+| R1 | HeadlessMC 不能接收外部 token 或自定义 javaagent | 自写启动器，只借用 `headlessmc-lwjgl` |
+| R2 | 其他 mod 在无头模式下初始化渲染资源时崩溃（YSM、TACZ 已实测可用） | 逐个排查；需要时在 bridge 里加 mixin 跳过相关渲染初始化，或从 bot 的 mod 列表中去掉 |
+| R3 | Baritone 对 mod 方块（非完整碰撞箱、自定义流体）判断错误 | 通过卡住检测和失败 hint 让 LLM 绕开；必要时给 Baritone 配置 `blocksToAvoid` |
+| R4 | 无头模式下 `Screen` 的 `init` 依赖渲染资源 | HeadlessMC 已覆盖大部分情况；控件列表在 `init` 后读取 |
+| R5 | LLM 成本和延迟 | 依靠 `wait`、心跳、工具结果老化、预算限制 |
+| R6 | 服务器反作弊 | Baritone 的 `antiCheatCompatibility`，禁用 parkour 和 freeLook，动作频率限流 |
+
+## 11. 里程碑
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **M0 技术验证** | HeadlessMC 无头启动 + authlib-injector + bridge 只实现 `bridge.hello` 和 `observe.status` | Node 脚本能连上并打印 bot 在服务器中的坐标；R1 有结论 |
+| **M1 Bridge 基础** | observe.* 全部、action.* 基础部分、task.*（Baritone）、事件 | 用脚本驱动 bot 完成"走到树旁、砍 5 个原木、捡起掉落物" |
+| **M2 Agent 基础** | LLM 客户端、工具注册、主循环、`wait`、聊天限流、记忆工具、转录日志 | bot 能自主行动 30 分钟以上不卡死，并能和玩家聊天 |
+| **M3 知识与界面** | knowledge.*（JEI + 原版兜底）、`knowledge.plan`、menu.*、`menu.jei_transfer`、合成、容器、mod GUI 控件 | bot 自主完成从原木到石镐；能把物品存进箱子；能查 JEI 并用厨锅做出一道 Farmer's Delight 料理 |
+| **M3.5 TACZ** | tacz.*、`task.tacz_engage`、命中反馈 | bot 持枪击杀僵尸，并能自己换弹 |
+| **M4 健壮性** | 上下文压缩、断线重连、MC 崩溃重启、死亡处理、预算 | 连续运行 24 小时 |
+| **M5 评估** | 指标（存活时长、科技进度、token 成本），提示词迭代 | — |
+
+## 12. 待决问题
+
+已决议：
+
+- 感知模式可配置，默认 `visible`（§6.3）。
+- 死亡交给模型处理，超时兜底自动重生（§7.3）。
+- 底层 `menu.click` 也暴露给模型，提示词引导优先使用高层工具（§7.3）。
+- 支持 attach 模式（§7.8）。
+- TACZ 提供专用工具，作为可选模块（§6.3 tacz.*）。
+
+仍待验证（M0 / M3.5）：
+
+1. HeadlessMC 能否接收外部 token 和 javaagent（R1）。
+2. TACZ 的命中和击杀事件在客户端能否收到。
+3. 无头模式下 TACZ 的 `shoot()` 是否依赖动画状态机（`isReadyToDraw` 等）。如果依赖，需要确认 `draw` 能在没有渲染的情况下正常完成。
+4. 无头模式下 JEI 的 runtime 能否正常就绪（`onRuntimeAvailable` 会在进服、配方和 tag 同步完成后触发）；`createRecipeLayoutDrawable` 是否会碰到渲染资源。
+5. JEI 中 mod 自定义的配方对象，额外信息（耗时、能量）能提取多少。初期只保证输入、输出和 catalyst。
