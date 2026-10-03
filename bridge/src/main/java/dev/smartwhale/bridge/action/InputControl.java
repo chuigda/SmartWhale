@@ -18,8 +18,8 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * Multi-tick mouse input. Vanilla calls {@code continueAttack(false)} every tick when the (hidden) window
- * has no grabbed mouse, which aborts block breaking, so {@code MinecraftMixin} hands that call to us while
- * we are breaking. Holding "use" is done with the real key binding plus suppressing vanilla's re-use.
+ * has no grabbed mouse, which aborts block breaking, so {@code MinecraftMixin} suppresses that call while
+ * we are breaking and we drive breaking from our own tick. Holding "use" is done with the real key binding plus suppressing vanilla's re-use.
  */
 public final class InputControl {
     private static Breaking breaking;
@@ -140,15 +140,9 @@ public final class InputControl {
         using = null;
     }
 
-    /** MinecraftMixin hook; true = we handled this tick's attack input. */
+    /** MinecraftMixin hook; true = vanilla must not touch block breaking this tick (it would abort ours). */
     public static boolean onContinueAttack() {
-        if (breaking == null) return false;
-        if (breaking.done.isDone()) {
-            breaking = null;
-            return false;
-        }
-        breaking.step();
-        return true;
+        return breaking != null && !breaking.done.isDone();
     }
 
     /** MinecraftMixin hook; true = vanilla must not start another use while we hold the key. */
@@ -156,14 +150,23 @@ public final class InputControl {
         return using != null;
     }
 
+    /**
+     * Breaking is driven from here rather than from vanilla's continueAttack, which only runs while no
+     * screen is open (e.g. not during the loading screen after a respawn).
+     */
+    @SubscribeEvent
+    public void onTickPre(ClientTickEvent.Pre event) {
+        if (breaking == null) return;
+        if (breaking.done.isDone()) {
+            breaking = null;
+            return;
+        }
+        breaking.step();
+    }
+
     @SubscribeEvent
     public void onTick(ClientTickEvent.Post event) {
         Minecraft mc = Minecraft.getInstance();
-        if (breaking != null && !breaking.done.isDone()) {
-            // continueAttack only runs while no screen is open; a stalled break would otherwise hang.
-            if (mc.player == null) breaking.fail("not in world");
-            else if (mc.screen != null && ++breaking.ticks > breaking.timeoutTicks) breaking.fail("a screen is open");
-        }
         if (using == null) return;
         LocalPlayer p = mc.player;
         if (p == null) {

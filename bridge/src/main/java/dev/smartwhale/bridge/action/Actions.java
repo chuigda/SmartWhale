@@ -278,29 +278,59 @@ public final class Actions {
         return r;
     }
 
-    /** Picks the fastest tool for {@code state} from the inventory and puts it in the main hand. */
-    public static void selectBestTool(LocalPlayer p, BlockState state) {
+    /**
+     * Puts the best tool for the block in the main hand. Without a proper tool (one that is faster than a
+     * bare hand or needed for drops) it switches to an empty hand, so held items such as guns, food or
+     * swords are not used to break blocks (some of them cannot break blocks at all).
+     */
+    public static void selectBestTool(LocalPlayer p, BlockPos pos, BlockState state) {
         Inventory inv = p.getInventory();
         int best = -1;
-        float bestScore = toolScore(inv.getItem(inv.selected), state);
+        float bestScore = 0;
         for (int i = 0; i < 36; i++) {
-            ItemStack s = inv.getItem(i);
-            if (s.isEmpty()) continue;
-            float score = toolScore(s, state);
-            if (score > bestScore) {
+            float score = toolScore(p, inv.getItem(i), pos, state);
+            if (score > bestScore || score == bestScore && score > 0 && i == inv.selected) {
                 best = i;
                 bestScore = score;
             }
         }
-        if (best < 0) return;
-        if (best >= 9 && p.containerMenu != p.inventoryMenu) return;
-        Inv.toMainHand(p, best);
+        boolean inventoryUsable = p.containerMenu == p.inventoryMenu;
+        if (best >= 0 && (best < 9 || inventoryUsable)) {
+            Inv.toMainHand(p, best);
+            return;
+        }
+        if (inv.getItem(inv.selected).isEmpty()) return;
+        for (int i = 0; i < 9; i++) {
+            if (inv.getItem(i).isEmpty()) {
+                inv.selected = i;
+                return;
+            }
+        }
+        // Hotbar full: move the held item into a free main-inventory slot.
+        if (!inventoryUsable) return;
+        for (int i = 9; i < 36; i++) {
+            if (inv.getItem(i).isEmpty()) {
+                Inv.click(p, Inv.menuSlot(i), inv.selected, ClickType.SWAP);
+                return;
+            }
+        }
     }
 
-    private static float toolScore(ItemStack s, BlockState state) {
-        // Getting drops matters more than speed.
-        boolean drops = !state.requiresCorrectToolForDrops() || s.isCorrectToolForDrops(state);
-        return (drops ? 1000.0F : 0.0F) + s.getDestroySpeed(state);
+    /** 0 = no better than a bare hand. Getting drops matters more than speed. */
+    private static float toolScore(LocalPlayer p, ItemStack s, BlockPos pos, BlockState state) {
+        if (s.isEmpty() || !s.getItem().canAttackBlock(state, p.level(), pos, p)) return 0;
+        float speed = s.getDestroySpeed(state);
+        boolean neededForDrops = state.requiresCorrectToolForDrops() && s.isCorrectToolForDrops(state);
+        if (!neededForDrops && speed <= 1.0F) return 0;
+        return (neededForDrops ? 1000.0F : 0.0F) + speed;
+    }
+
+    /** Whether breaking {@code state} with the best available tool yields drops. */
+    public static boolean canHarvest(LocalPlayer p, BlockState state) {
+        if (!state.requiresCorrectToolForDrops()) return true;
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < 36; i++) if (inv.getItem(i).isCorrectToolForDrops(state)) return true;
+        return false;
     }
 
     /** Validates and starts breaking; shared with task.mine. */
@@ -314,9 +344,12 @@ public final class Actions {
         if (!Perception.visible(p, level, pos)) {
             throw target("You can't see that block", "Clear the line of sight or break the block in front of it first");
         }
-        if (autoTool) selectBestTool(p, state);
+        if (autoTool) selectBestTool(p, pos, state);
         Direction face = visibleFace(p, pos);
-        return InputControl.startBreaking(pos, face, state.getBlock(), 20 * 30);
+        // Twice the expected time (it changes e.g. when the bot falls or gets wet), capped at 60 s.
+        float perTick = state.getDestroyProgress(p, level, pos);
+        int timeout = perTick <= 0 ? 20 * 60 : (int) Math.min(20 * 60, Math.ceil(1 / perTick) * 2 + 40);
+        return InputControl.startBreaking(pos, face, state.getBlock(), timeout);
     }
 
     private static CompletableFuture<JsonElement> breakBlock(JsonObject params) {

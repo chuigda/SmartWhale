@@ -27,6 +27,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.Comparator;
@@ -198,6 +199,7 @@ public final class BaritoneTasks {
         final int count;
         final int radius;
         final Set<BlockPos> blacklist = new HashSet<>();
+        final JsonArray skipped = new JsonArray();
         State state = State.SELECT;
         BlockPos target;
         BlockPos lastBroken;
@@ -246,6 +248,13 @@ public final class BaritoneTasks {
                                 "No more reachable " + String.join("/", match.spec()) + " in sight", extra);
                     }
                     target = found.get(0).pos();
+                    BlockState state = level.getBlockState(target);
+                    if (!Actions.canHarvest(p, state)) {
+                        JsonObject extra = summary();
+                        extra.addProperty("block", Game.id(state.getBlock()));
+                        return Outcome.fail("no_tool", Game.id(state.getBlock())
+                                + " needs a proper tool to drop anything and none is in the inventory", extra);
+                    }
                     enter(State.APPROACH);
                 }
                 case APPROACH -> {
@@ -259,7 +268,7 @@ public final class BaritoneTasks {
                             breaking = Actions.startBreak(p, target, true);
                             enter(State.BREAK);
                         } catch (RpcException e) {
-                            giveUp();
+                            giveUp(e.getMessage());
                         }
                         return null;
                     }
@@ -267,7 +276,8 @@ public final class BaritoneTasks {
                         Bari.get().getCustomGoalProcess().setGoalAndPath(new GoalGetToBlock(target));
                         pathing = true;
                     }
-                    if (stateTicks > 1200 || stateTicks > 10 && baritoneDone()) giveUp();
+                    if (stateTicks > 1200) giveUp("could not get within reach in 60 s");
+                    else if (stateTicks > 10 && baritoneDone()) giveUp("no path to a spot where it is in reach and visible");
                 }
                 case BREAK -> {
                     TaskManager.get().touch();
@@ -277,7 +287,7 @@ public final class BaritoneTasks {
                         lastBroken = target;
                         enter(State.COLLECT);
                     } else {
-                        giveUp();
+                        giveUp("breaking failed: " + breaking.failure());
                     }
                 }
                 case COLLECT -> {
@@ -304,8 +314,14 @@ public final class BaritoneTasks {
             return null;
         }
 
-        private void giveUp() {
+        private void giveUp(String reason) {
             blacklist.add(target);
+            if (skipped.size() < 8) {
+                JsonObject o = new JsonObject();
+                o.add("pos", Json.blockPos(target));
+                o.addProperty("reason", reason);
+                skipped.add(o);
+            }
             Bari.cancel();
             enter(State.SELECT);
         }
@@ -322,6 +338,7 @@ public final class BaritoneTasks {
             JsonObject o = new JsonObject();
             o.addProperty("mined", mined);
             o.addProperty("requested", count);
+            if (!skipped.isEmpty()) o.add("skipped", skipped.deepCopy());
             return o;
         }
 

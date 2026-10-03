@@ -40,8 +40,12 @@ console.log("task.mine started:", JSON.stringify(mine));
 const done = await waitTask(mine.task_id);
 console.log(done.method, JSON.stringify(done.params));
 
-const collect = await rpc("task.collect_items", { radius: 8 });
-console.log("task.collect_items:", JSON.stringify(collect));
-if (collect.task_id) console.log((await waitTask(collect.task_id, 60)).method);
+// task.mine already picks up its drops; this only catches stragglers and fails when there are none.
+try {
+  const collect = await rpc("task.collect_items", { radius: 8 });
+  console.log((await waitTask(collect.task_id, 60)).method);
+} catch (e) {
+  console.log("task.collect_items:", (e as Error).message);
+}
 
 console.log("logs after:", logs(await rpc("observe.inventory")));
