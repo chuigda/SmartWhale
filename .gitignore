@@ -1,0 +1,29 @@
+# secrets
+password.txt
+*.secret
+.env
+
+# per-user bot configs (only the example is tracked)
+config/*.json
+!config/bot.example.json
+
+# runtime
+run/
+data/
+tools/
+
+# node
+node_modules/
+dist/
+
+# gradle / java
+.gradle/
+build/
+bridge/run/
+*.class
+.idea/
+*.iml
+out/
+
+# third-party mod jars (compileOnly / injected into bots)
+libs/

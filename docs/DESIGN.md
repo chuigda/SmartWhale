@@ -25,7 +25,7 @@
 ```mermaid
 flowchart LR
   subgraph Node["agent/ (TypeScript, Node)"]
-    Sup[Launcher / Supervisor<br/>Yggdrasil 认证 · 实例准备 · HeadlessMC 子进程]
+    Sup[Launcher / Supervisor<br/>Yggdrasil 认证 · 实例准备 · MC 子进程]
     Loop[Agent Loop<br/>自主循环 · 上下文管理]
     LLM[LLM Client<br/>OpenAI 兼容 /chat/completions]
     Tools[Tool Registry<br/>游戏工具 · 记忆工具 · 控制工具]
@@ -72,7 +72,7 @@ SmartWhale/
 │  └─ src/main/
 │     ├─ java/dev/smartwhale/bridge/
 │     │  ├─ SmartWhaleBridge.java        # @Mod 入口
-│     │  ├─ server/                      # Netty WebSocket 服务端、鉴权、JSON-RPC 分发
+│     │  ├─ server/                      # WebSocket 服务端（自带 RFC 6455 实现）、鉴权、JSON-RPC 分发
 │     │  ├─ rpc/                         # 方法注册表、参数/结果 DTO、错误码
 │     │  ├─ observe/                     # 状态、背包、方块、实体、界面
 │     │  ├─ knowledge/                   # 注册表、配方、物品信息
@@ -90,7 +90,7 @@ SmartWhale/
 │  └─ src/
 │     ├─ main.ts                         # CLI 入口：smartwhale run <config>
 │     ├─ config/                         # 配置 schema (zod) 与加载
-│     ├─ launcher/                       # 实例准备、Yggdrasil、HeadlessMC 子进程
+│     ├─ launcher/                       # 实例准备、Yggdrasil、直接启动 MC 子进程
 │     ├─ bridge/                         # WS JSON-RPC 客户端、事件流、协议类型
 │     ├─ llm/                            # OpenAI 兼容客户端、重试、计费
 │     ├─ tools/                          # 工具定义（zod schema → JSON Schema）
@@ -132,17 +132,23 @@ SmartWhale/
 
 ### 4.2 无头化
 
-使用 [HeadlessMC](https://github.com/headlesshq/headlessmc) 作为启动器。它的 `-lwjgl` 模式会在字节码层面把 LWJGL 的 GLFW/OpenGL/OpenAL 调用替换为空实现，客户端照常 tick，但不创建窗口，也不渲染。
+客户端保留**真实的 GL 上下文**，只是不显示窗口、不渲染：
 
-- Java：`D:\Applications\JDK21\bin\java.exe`。
-- 在 `run/<bot>/HeadlessMC/config.properties` 中指定 mc 目录、游戏目录和 Java 路径。
+- `agent/launcher/game.ts` 读取启动器安装好的合并版 version json（不支持 `inheritsFrom`），自己拼 classpath、JVM 参数和游戏参数，直接启动 `java`，不借助第三方启动器。
+  - 规则匹配兼容 HMCL 的非标准写法 `os.name: "universal"`（表示任意 OS）。
+  - natives 目录优先使用实例里 HMCL 已解压的 `natives-windows-x86_64`。
+- bridge 的 mixin 负责隐藏窗口，只在 `-Dsmartwhale.bridge.headless=true` 时生效，所以 attach 模式下的正常客户端不受影响：
+  - `WindowMixin`：创建窗口时设置 `GLFW_VISIBLE=false`，并在 `updateDisplay` 后保持隐藏。
+  - `GameRendererMixin`：加载 overlay 结束后取消 `GameRenderer.render`。
+- launcher 往游戏目录的 `config/fml.toml` 写入 `earlyWindowControl = false`，否则 FML 的早期加载窗口会在 mod 加载之前弹出来。
 - 启动时附加的 JVM 参数：
-  - `-javaagent:<authlib-injector.jar>=<yggdrasil API URL>`
-  - `-Dsmartwhale.bridge.port=<port>`、`-Dsmartwhale.bridge.token=<随机 secret>`
-- 启动后直接进服，使用 `--quickPlayMultiplayer <host:port>`（1.20+ 原生支持）。
-- launcher 接管 HeadlessMC 子进程的 stdout/stderr 并写入日志；进程退出时按退避策略重启。
+  - `-javaagent:<authlib-injector.jar>=<yggdrasil API URL>`、`-Dauthlibinjector.side=client`
+  - `-Dsmartwhale.bridge.port=<port>`、`-Dsmartwhale.bridge.token=<随机 secret>`、`-Dsmartwhale.bridge.headless=true`
+  - `-Dsmartwhale.bridge.autoconnect=<host:port>`：bridge 在标题界面或断线界面自动连接服务器，失败按指数退避重试，并通过 `event.disconnect_screen` 上报断线原因。
+  - `-Dstdout.encoding=UTF-8` 等：launcher 按 UTF-8 解码子进程输出。
+- launcher 接管子进程的 stdout/stderr 并写入 `data/<bot>/logs/minecraft.log`，token 会被打码。
 
-> ⚠️ **风险 R1**：HeadlessMC 能否接收外部传入的 `accessToken/uuid/username`。如果不能，退回方案是由 `agent/launcher` 自己解析 version json、拼 classpath 和参数，只借用 `headlessmc-lwjgl` 做 patch。
+> **为什么不用 HeadlessMC**（M0 结论）：HeadlessMC 的 `-lwjgl` 会把 LWJGL 换成空实现，完全没有 GL 上下文。YSM 的 native 库（`ysm-core.dll`）在加载阶段依赖 GL，在这种环境下会报 `RuntimeException: err: 35`。而服务端要求客户端必须装 YSM，否则在注册表同步阶段就会被拒。换成真实 LWJGL 加隐藏窗口后问题消失。代价是每个 bot 占一个隐藏的 GL 上下文，不渲染时开销很小。
 
 ### 4.3 认证（authlib-injector）
 
@@ -150,23 +156,24 @@ SmartWhale/
 
 1. 读取 `data/<bot>/auth.json`。如果有缓存 token，先调用 `POST {api}/authserver/validate` 检查，失效则调用 `/refresh`。
 2. 没有缓存或刷新失败时，调用 `POST {api}/authserver/authenticate`：`{ username, password, clientToken, agent: { name: "Minecraft", version: 1 } }`，拿到 `accessToken` 和 `selectedProfile { id, name }`。
-3. 密码只从环境变量读取（`SMARTWHALE_AUTH_PASSWORD`），不写入配置文件和日志。
+3. 密码优先从环境变量读取（`SMARTWHALE_AUTH_PASSWORD`），其次读取 `passwordFile` 指向的文件（该文件已被 git 忽略，只包含密码）；密码不写入配置文件和日志。
 4. 预取 API 元数据，通过 `-Dauthlibinjector.yggdrasil.prefetched=<base64>` 传入，免去 agent 启动时的一次网络请求。
-5. 游戏参数：`--username <name> --uuid <id> --accessToken <token> --userType mojang`。
+5. 游戏参数：`--username <name> --uuid <id> --accessToken <token> --userType msa --clientId 0 --xuid 0`。
 
 ## 5. Bridge mod 设计
 
 ### 5.1 技术选择
 
 - 构建：ModDevGradle，NeoForge 21.1.252，Parchment mappings，Java 21。
-- WebSocket：直接使用 MC 自带的 **Netty**（`HttpServerCodec` + `WebSocketServerProtocolHandler`），不引入额外依赖，也不需要 jar-in-jar。
+- WebSocket：MC 自带的 Netty 不包含 `netty-codec-http`，所以 bridge 内置一个最小的 RFC 6455 实现（阻塞 socket 加线程池），只监听 `127.0.0.1`。不引入额外依赖，也不需要 jar-in-jar。
+- 开发时可以用 `bridge/quickbuild.mjs` 直接拿实例里的 jar 跑 javac，几秒出包；Gradle 构建（ModDevGradle）用于正式产物。
 - JSON：使用 MC 自带的 Gson。
 - Baritone：以 `baritone-api-neoforge-1.11.2` 作为编译依赖，运行时把 standalone jar 放进 `mods/`。
 - 只在客户端加载（`neoforge.mods.toml` 中 `side = "CLIENT"`）。
 
 ### 5.2 线程模型
 
-- Netty IO 线程负责接收请求、解析 JSON-RPC。
+- 连接线程负责接收请求、解析 JSON-RPC。
 - **所有涉及游戏状态的读写**都通过 `Minecraft.getInstance().submit(...)` 投递到客户端主线程执行，再把结果带回 IO 线程写出。
 - 长任务（寻路、挖矿等）由 `TaskManager` 在客户端 tick 事件里推进，结束时发出通知。
 - 每个请求有超时（默认 10s），超时返回错误，不阻塞主线程。
@@ -445,7 +452,7 @@ stateDiagram-v2
 
 | 模式 | 命令 | 说明 |
 |---|---|---|
-| launch（默认） | `smartwhale run config/whale.json` | 由 launcher 完成认证、准备实例、启动 HeadlessMC、自动进服；端口和 token 随机生成，通过系统属性传给 bridge |
+| launch（默认） | `smartwhale run config/whale.json` | 由 launcher 完成认证、准备实例、启动客户端、自动进服；端口和 token 随机生成，通过系统属性传给 bridge |
 | attach（开发） | `smartwhale run config/whale.json --attach ws://127.0.0.1:25599 --token dev` | 不启动 MC，直接连接已经在运行的客户端（例如 IDE 的 `runClient` 带窗口，手动进服）。bridge 从 `config/smartwhale-bridge.toml` 读取固定的端口和 token。这种模式下不做认证、不做守护，断线后只重连 WS |
 
 ## 8. 配置
@@ -498,20 +505,20 @@ stateDiagram-v2
 | 部分 | 选择 |
 |---|---|
 | MC 端构建 | Gradle + ModDevGradle，Java 21（`D:\Applications\JDK21`） |
-| MC 端依赖 | NeoForge 21.1.252，Baritone API 1.11.2（neoforge），Netty / Gson（MC 自带）；TACZ 1.1.8、JEI 19.x API（均为 `compileOnly`，可选） |
+| MC 端依赖 | NeoForge 21.1.252，Baritone API 1.11.2（neoforge），Gson（MC 自带）；TACZ 1.1.8、JEI 19.x API（均为 `compileOnly`，可选） |
 | Node 端 | Node ≥ 22，TypeScript（ESM，strict），npm |
 | Node 依赖 | `ws`、`zod`（v4，自带 JSON Schema 导出）、`pino`、`vitest`（测试）；HTTP 用原生 `fetch` |
-| 无头启动 | HeadlessMC（`-lwjgl`） |
+| 无头启动 | 自写启动器 + 隐藏窗口 mixin（真实 LWJGL/GL） |
 | 认证 | authlib-injector，Yggdrasil authserver API |
 
 ## 10. 风险
 
 | # | 风险 | 应对 |
 |---|---|---|
-| R1 | HeadlessMC 不能接收外部 token 或自定义 javaagent | 自写启动器，只借用 `headlessmc-lwjgl` |
-| R2 | 其他 mod 在无头模式下初始化渲染资源时崩溃（YSM、TACZ 已实测可用） | 逐个排查；需要时在 bridge 里加 mixin 跳过相关渲染初始化，或从 bot 的 mod 列表中去掉 |
+| R1 | ~~HeadlessMC 不能接收外部 token 或自定义 javaagent~~ | 已解决：改为自写启动器加隐藏窗口（§4.2） |
+| R2 | 其他 mod 在跳过渲染后出问题（YSM、TACZ 已在隐藏窗口方案下实测可用） | 逐个排查；需要时在 bridge 里加 mixin，或从 bot 的 mod 列表中去掉 |
 | R3 | Baritone 对 mod 方块（非完整碰撞箱、自定义流体）判断错误 | 通过卡住检测和失败 hint 让 LLM 绕开；必要时给 Baritone 配置 `blocksToAvoid` |
-| R4 | 无头模式下 `Screen` 的 `init` 依赖渲染资源 | HeadlessMC 已覆盖大部分情况；控件列表在 `init` 后读取 |
+| R4 | 无头模式下 `Screen` 的 `init` 依赖渲染资源 | GL 上下文是真实的，`init` 照常执行；控件列表在 `init` 后读取 |
 | R5 | LLM 成本和延迟 | 依靠 `wait`、心跳、工具结果老化、预算限制 |
 | R6 | 服务器反作弊 | Baritone 的 `antiCheatCompatibility`，禁用 parkour 和 freeLook，动作频率限流 |
 
@@ -519,7 +526,7 @@ stateDiagram-v2
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **M0 技术验证** | HeadlessMC 无头启动 + authlib-injector + bridge 只实现 `bridge.hello` 和 `observe.status` | Node 脚本能连上并打印 bot 在服务器中的坐标；R1 有结论 |
+| **M0 技术验证** ✅ | 无头启动 + authlib-injector + bridge 只实现 `bridge.hello` 和 `observe.status` | Node 脚本能连上并打印 bot 在服务器中的坐标；R1 有结论 |
 | **M1 Bridge 基础** | observe.* 全部、action.* 基础部分、task.*（Baritone）、事件 | 用脚本驱动 bot 完成"走到树旁、砍 5 个原木、捡起掉落物" |
 | **M2 Agent 基础** | LLM 客户端、工具注册、主循环、`wait`、聊天限流、记忆工具、转录日志 | bot 能自主行动 30 分钟以上不卡死，并能和玩家聊天 |
 | **M3 知识与界面** | knowledge.*（JEI + 原版兜底）、`knowledge.plan`、menu.*、`menu.jei_transfer`、合成、容器、mod GUI 控件 | bot 自主完成从原木到石镐；能把物品存进箱子；能查 JEI 并用厨锅做出一道 Farmer's Delight 料理 |
@@ -537,10 +544,11 @@ stateDiagram-v2
 - 支持 attach 模式（§7.8）。
 - TACZ 提供专用工具，作为可选模块（§6.3 tacz.*）。
 
-仍待验证（M0 / M3.5）：
+- 无头方案：自写启动器 + 隐藏窗口，不用 HeadlessMC（§4.2，M0 结论）。
 
-1. HeadlessMC 能否接收外部 token 和 javaagent（R1）。
-2. TACZ 的命中和击杀事件在客户端能否收到。
-3. 无头模式下 TACZ 的 `shoot()` 是否依赖动画状态机（`isReadyToDraw` 等）。如果依赖，需要确认 `draw` 能在没有渲染的情况下正常完成。
-4. 无头模式下 JEI 的 runtime 能否正常就绪（`onRuntimeAvailable` 会在进服、配方和 tag 同步完成后触发）；`createRecipeLayoutDrawable` 是否会碰到渲染资源。
-5. JEI 中 mod 自定义的配方对象，额外信息（耗时、能量）能提取多少。初期只保证输入、输出和 catalyst。
+仍待验证（M3 / M3.5）：
+
+1. TACZ 的命中和击杀事件在客户端能否收到。
+2. 无头模式下 TACZ 的 `shoot()` 是否依赖动画状态机（`isReadyToDraw` 等）。如果依赖，需要确认 `draw` 能在没有渲染的情况下正常完成。
+3. 无头模式下 JEI 的 runtime 能否正常就绪（`onRuntimeAvailable` 会在进服、配方和 tag 同步完成后触发）；`createRecipeLayoutDrawable` 是否会碰到渲染资源。
+4. JEI 中 mod 自定义的配方对象，额外信息（耗时、能量）能提取多少。初期只保证输入、输出和 catalyst。

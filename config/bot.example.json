@@ -1,0 +1,24 @@
+{
+  "name": "whale",
+  "minecraft": {
+    "root": "D:\\.minecraft",
+    "version": "1.21.1-NeoForge",
+    "instance": "D:\\.minecraft\\versions\\1.21.1-NeoForge",
+    "java": "D:\\Applications\\JDK21\\bin\\java.exe",
+    "server": "localhost:25565",
+    "jvmArgs": ["-Xmx4G"],
+    "mods": {
+      "source": "D:\\.minecraft\\versions\\1.21.1-NeoForge\\mods",
+      "exclude": ["sodium-*", "iris-*", "BetterF3-*", "mobhealthbar-*", "appleskin-*"],
+      "extra": ["libs/baritone-api-neoforge-1.11.2.jar"]
+    },
+    "copyFromInstance": ["config", "defaultconfigs", "tacz"]
+  },
+  "auth": {
+    "type": "authlib-injector",
+    "apiRoot": "https://littleskin.cn/api/yggdrasil",
+    "username": "YourName",
+    "passwordEnv": "SMARTWHALE_AUTH_PASSWORD",
+    "passwordFile": "password.txt"
+  }
+}
