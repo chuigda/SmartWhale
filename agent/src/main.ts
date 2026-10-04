@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { loadConfig, readPassword } from "./config/load.ts";
+import { loadConfig, loadLlmConfig, readPassword } from "./config/load.ts";
+import { LlmClient } from "./llm/client.ts";
+import { Agent } from "./agent/agent.ts";
 import { prepareInstance } from "./launcher/instance.ts";
 import { obtainSession, prefetchMetadata } from "./launcher/yggdrasil.ts";
 import { freePort, launch, type GameProcess } from "./launcher/game.ts";
@@ -16,7 +18,8 @@ const USAGE = `Usage:
   node src/main.ts <config.json>                         launch the headless client and attach
   node src/main.ts <config.json> --attach <ws-url> --token <t>   attach to a running client
 Options:
-  --control-port <n>   local HTTP endpoint for manual RPC calls (see src/bridge/control.ts)`;
+  --control-port <n>   local HTTP endpoint for manual RPC calls (see src/bridge/control.ts)
+  --no-agent           connect only; don't start the LLM agent`;
 
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
@@ -25,6 +28,7 @@ async function main(): Promise<void> {
       attach: { type: "string" },
       token: { type: "string" },
       "control-port": { type: "string" },
+      "no-agent": { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -88,6 +92,28 @@ async function main(): Promise<void> {
   bridge.on("event", (e) => log.info(`event ${e.method}`, e.params));
   bridge.on("close", () => log.warn("Bridge connection closed"));
   if (values["control-port"]) startControlServer(bridge, Number(values["control-port"]));
+
+  if (values["no-agent"]) return;
+  const llmConfig = loadLlmConfig(config);
+  if (!llmConfig) {
+    log.warn('No "llm" section in the config; running without the agent (see config/bot.example.json)');
+    return;
+  }
+  const llm = new LlmClient(llmConfig);
+  log.info(`LLM ${llm.config.model} at ${llm.config.baseUrl}`);
+  const { name } = await bridge.call<{ name: string }>("observe.status", {});
+  const agent = new Agent({
+    bridge,
+    hello,
+    llm,
+    name,
+    persona: config.agent.persona,
+    aliases: config.agent.aliases,
+    maxTokensPerTurn: config.agent.maxTokensPerTurn,
+    dataDir: resolveFromRoot(path.join("data", config.name)),
+  });
+  abort.signal.addEventListener("abort", () => agent.stop());
+  await agent.run();
 }
 
 main().catch((e) => {

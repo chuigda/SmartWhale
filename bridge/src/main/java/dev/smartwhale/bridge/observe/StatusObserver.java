@@ -49,6 +49,12 @@ public final class StatusObserver {
         r.addProperty("armor", p.getArmorValue());
         r.addProperty("on_ground", p.onGround());
         r.addProperty("in_water", p.isInWater());
+        boolean underwater = p.isUnderWater();
+        r.addProperty("underwater", underwater);
+        if (underwater || p.getAirSupply() < p.getMaxAirSupply()) {
+            r.addProperty("air", p.getAirSupply());
+            r.addProperty("max_air", p.getMaxAirSupply());
+        }
         r.addProperty("on_fire", p.isOnFire());
         r.addProperty("dead", p.isDeadOrDying());
         level.getBiome(bp).unwrapKey().ifPresent(k -> r.addProperty("biome", k.location().toString()));

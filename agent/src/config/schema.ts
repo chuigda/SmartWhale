@@ -44,6 +44,55 @@ export const ConfigSchema = z.object({
       authlibInjector: z.string().default("tools/authlib-injector-1.2.8.jar"),
     })
     .default({ authlibInjector: "tools/authlib-injector-1.2.8.jar" }),
+  /** Path to an LLM config file (relative to the repo root) or the same object inline (docs/DESIGN.md §8). */
+  llm: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
+  agent: z
+    .object({
+      persona: z.string().optional(),
+      /** Extra names that count as a mention in chat (case-insensitive). */
+      aliases: z.array(z.string()).default([]),
+      maxTokensPerTurn: z.number().int().min(256).default(8192),
+    })
+    .default({ aliases: [], maxTokensPerTurn: 8192 }),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
+
+export const LlmSchema = z
+  .object({
+    baseUrl: z.string().url().optional(),
+    baseURL: z.string().url().optional(),
+    apiKey: z.string().optional(),
+    apiKeyEnv: z.string().optional(),
+    model: z.string(),
+    /** Average output speed in tokens/second, used to estimate turn duration. */
+    averageTts: z.number().positive().default(50),
+    /** Hard limit: no request may exceed it. */
+    contextWindow: z.number().int().positive().default(128000),
+    /** Compaction starts once the context exceeds this (docs/DESIGN.md §7.5). */
+    practicalContextWindow: z.number().int().positive().optional(),
+    outputlength: z.number().int().positive().default(8192),
+    vision: z.boolean().default(false),
+    thinking: z.boolean().default(false),
+    supportThinkingEfforts: z.array(z.string()).default([]),
+    fillInMiddle: z.boolean().default(false),
+    /** echo: send reasoning_content of completed turns back to the API; drop: omit it. */
+    reasoning: z.enum(["echo", "drop"]).default("echo"),
+    temperature: z.number().min(0).max(2).optional(),
+  })
+  .refine((c) => c.baseUrl ?? c.baseURL, { message: "baseUrl is required" })
+  .refine((c) => c.apiKey ?? c.apiKeyEnv, { message: "apiKey or apiKeyEnv is required" });
+
+export interface LlmConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  averageTts: number;
+  contextWindow: number;
+  practicalContextWindow: number;
+  outputlength: number;
+  vision: boolean;
+  thinking: boolean;
+  reasoning: "echo" | "drop";
+  temperature?: number;
+}

@@ -5,6 +5,7 @@ password.txt
 
 # per-user bot configs (only the example is tracked)
 config/*.json
+config/*.jsonc
 !config/bot.example.json
 
 # runtime

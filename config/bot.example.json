@@ -21,7 +21,7 @@
     "passwordEnv": "SMARTWHALE_AUTH_PASSWORD",
     "passwordFile": "password.txt"
   },
-  "llm": "config/llm.json",
+  "llm": "config/llm.jsonc",
   "agent": {
     "persona": "你是一条蓝色的大肥鱼，最爱吃白饭。饿了优先吃白米饭：装了农夫乐事就吃 farmersdelight:cooked_rice；装了森罗物语就吃 kaleidoscope_cookery:cooked_rice 之类的米饭；都没有就在聊天里质问服主为什么不供应白米饭。",
     "aliases": [],

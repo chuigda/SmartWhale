@@ -436,7 +436,7 @@ TACZ 的枪械既不走原版 `attack`，也不走 `use_item`，而是由客户�
 ### 7.1 LLM 客户端
 
 - 只支持 **OpenAI 兼容**的 `POST {baseUrl}/chat/completions`（DeepSeek、各类中转），自己用 `fetch` 封装，不依赖 SDK。使用 `tools`，**流式**（`stream: true`，带 `stream_options.include_usage`）读取，以便随时中断（§7.3）。
-- 配置来自单独的 `config/llm.json`（不入库），字段见 §8：
+- 配置来自单独的 `config/llm.jsonc`（不入库），字段见 §8：
 
   | 字段 | 用途 |
   |---|---|
@@ -445,13 +445,15 @@ TACZ 的枪械既不走原版 `attack`，也不走 `use_item`，而是由客户�
   | `practicalContextWindow` | 超过后触发上下文压缩（§7.5） |
   | `outputlength` | `max_tokens` 的上限；每轮实际请求 `min(agent.maxTokensPerTurn, outputlength)` |
   | `averageTts` | 平均输出速度（token/秒），用于估算一轮耗时，写进日志 |
-  | `thinking` | 模型会输出 `reasoning_content`；agent 单独解析并保存 |
+  | `thinking` | 模型会输出 `reasoning_content`；agent 单独解析并保存。为 true 时，紧急事件引发的一轮会关闭思考（见下） |
+  | `supportThinkingEfforts` | 模型支持的思考强度（如 `low/medium/high`）；M2 只记录，暂不使用 |
   | `reasoning` | `echo`（默认）或 `drop`：完整轮次的思考内容是否作为 `reasoning_content` 回传给 API |
   | `vision` | M2 不用（感知是纯文本）；以后可选“按需渲染一帧截图”（§12） |
   | `fillInMiddle` | agent 不用 |
   | `temperature` | 可选 |
 
 - **思考内容**：流式响应里的 `reasoning_content` 单独收集，写进转录日志。完整轮次按 `llm.reasoning` 处理；已实测 DeepSeek 接受带或不带 `reasoning_content` 的 assistant 消息。请求被**中断**时，已经收到的部分思考和正文总是作为一条 assistant 消息留在会话里（标注 `[interrupted]`；`echo` 时思考放在 `reasoning_content`，`drop` 时并入正文），模型下一轮能接着之前的思路。
+- **紧急轮次关闭思考**：由紧急事件中断或唤醒而开始的一轮（§7.3），整轮的请求都带 `thinking: {"type": "disabled"}`，让模型尽快行动；不可配置。已实测 deepseek-flash 支持该字段（`reasoning_effort: "none"` 效果相同，`"low"` 约减少一半思考）。
 - 重试：对 429、5xx 和网络错误做指数退避（最多 5 次）；工具调用参数不是合法 JSON 或不符合 schema 时，把错误作为工具结果回传给模型，让它自己修正。
 - 用量：记录每次调用的输入、输出、缓存命中 token 和耗时，写进转录日志并定期汇总到控制台。**不设预算上限**。
 
@@ -488,7 +490,7 @@ stateDiagram-v2
 - **不停歇循环**：没有心跳和空闲状态，一轮结束就立即开始下一轮；只有 `wait` 会让 agent 停下来。两轮之间至少间隔 1 秒，防止出错时空转。
 - **每轮开头**：自动注入一条简短的 `[status]` 用户消息，包含坐标、生命、饥饿、没入水中时的氧气、时间和天气、手持物品、当前任务，以及自上一轮以来的事件。这样模型不用每轮都调 `observe_status`。
 - **事件调度**：
-  - **紧急事件**（`event.hurt`、`event.death`、`event.disconnected`、`event.task_finished`/`task_failed` 等，见 §6.4；模型自己取消或替换的任务除外）：模型正在思考时**立即中断**流式请求，已生成的思考和正文留在会话里（§7.1），带着事件开始新一轮；在 `wait` 中则立即唤醒。为了避免连续受伤时永远想不完，**因中断而开始的一轮只会再被死亡或断线中断**，期间的 `hurt` 进入队列。
+  - **紧急事件**（`event.hurt`、`event.death`、`event.disconnected`、`event.task_finished`/`task_failed` 等，见 §6.4；模型自己取消或替换的任务除外）：模型正在思考时**立即中断**流式请求，已生成的思考和正文留在会话里（§7.1），带着事件开始新一轮；在 `wait` 中则立即唤醒。为了避免连续受伤时永远想不完，**因中断而开始的一轮只会再被死亡或断线中断**，期间的 `hurt` 进入队列。由紧急事件开始的一轮（无论是中断思考还是唤醒 `wait`）**关闭思考**（§7.1）。
   - **聊天唤醒**：只有提到 bot（名字或 `agent.aliases` 中的别名，不区分大小写）或私聊才唤醒 `wait`；不中断正在进行的思考，下一轮注入。其他聊天进入队列，下一轮一起注入。bot 自己发出的消息忽略。
   - 其余事件进入队列，在下一轮统一注入；同类事件合并（如多次拾取）。
 - **聊天**：**不限流**。只检查 MC 单条 256 字符的上限：超长消息直接拒绝并返回错误，由模型自己缩短（bridge 的 `action.chat` 已经这样做）。
@@ -582,7 +584,7 @@ stateDiagram-v2
     "passwordEnv": "SMARTWHALE_AUTH_PASSWORD"
   },
   "bridge": { "port": 0, "perception": "visible" },
-  "llm": "config/llm.json",
+  "llm": "config/llm.jsonc",
   "agent": {
     "persona": "你是一条蓝色的大肥鱼，最爱吃白饭。",
     "aliases": ["鲸鱼"],
@@ -593,9 +595,9 @@ stateDiagram-v2
 
 `bridge.port = 0` 表示由 launcher 自动选一个空闲端口，并通过系统属性传给 bridge。`mods.extra` 里的相对路径相对仓库根目录。
 
-`llm` 可以是一个文件路径（相对仓库根目录），也可以直接内联同样的对象。LLM 配置单独放在 `config/llm.json`，不入库，多个 bot 可以共用：
+`llm` 可以是一个文件路径（相对仓库根目录），也可以直接内联同样的对象。LLM 配置单独放在 `config/llm.jsonc`（JSON with comments，不入库；模板见 `config/llm.example.jsonc`），多个 bot 可以共用：
 
-```json
+```jsonc
 {
   "baseUrl": "https://api.deepseek.com",
   "apiKey": "sk-...",
@@ -606,6 +608,7 @@ stateDiagram-v2
   "outputlength": 384000,
   "vision": true,
   "thinking": true,
+  "supportThinkingEfforts": ["low", "medium", "high"],
   "fillInMiddle": true,
   "reasoning": "echo",
   "temperature": 0.7
