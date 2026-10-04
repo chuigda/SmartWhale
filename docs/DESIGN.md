@@ -78,20 +78,24 @@ SmartWhale/
 │     │  ├─ knowledge/                   # 注册表、配方、物品信息
 │     │  ├─ action/                      # 瞬时动作（看、交互、攻击、放置、聊天…）
 │     │  ├─ menu/                        # 通用容器 / mod GUI 操作、合成
-│     │  ├─ task/                        # 长任务管理 + Baritone 适配
-│     │  ├─ event/                       # 游戏事件 → JSON-RPC 通知
+│     │  ├─ task/                        # 长任务管理（TaskManager、超时、卡住检测）
+│     │  ├─ event/                       # 游戏事件 → JSON-RPC 通知、自动连接
+│     │  ├─ mixin/                       # 隐藏窗口、跳过渲染、输入接管、拾取钩子
+│     │  ├─ util/                        # 参数解析、方块/物品匹配、tick 回调
 │     │  └─ compat/                      # 可选 mod 集成（按 ModList 条件加载）
+│     │     ├─ baritone/                 # 设置、task.* 实现（含 task.mine 循环）
 │     │     ├─ jei/                      # @JeiPlugin、RecipeSource、配方转移
 │     │     └─ tacz/                     # 枪械操作与状态
 │     └─ resources/META-INF/neoforge.mods.toml
 ├─ agent/                        # Node / TypeScript
 │  ├─ package.json
 │  ├─ tsconfig.json
+│  ├─ scripts/                           # 通过调试端点驱动 bot 的脚本（m1-demo.ts）
 │  └─ src/
 │     ├─ main.ts                         # CLI 入口：smartwhale run <config>
 │     ├─ config/                         # 配置 schema (zod) 与加载
 │     ├─ launcher/                       # 实例准备、Yggdrasil、直接启动 MC 子进程
-│     ├─ bridge/                         # WS JSON-RPC 客户端、事件流、协议类型
+│     ├─ bridge/                         # WS JSON-RPC 客户端、事件流、调试端点（control.ts）
 │     ├─ llm/                            # OpenAI 兼容客户端、重试、计费
 │     ├─ tools/                          # 工具定义（zod schema → JSON Schema）
 │     │  ├─ game/                        # 映射到 bridge 方法
@@ -101,6 +105,7 @@ SmartWhale/
 │     └─ util/
 ├─ config/
 │  └─ bot.example.json                   # 配置示例（真实配置不入库）
+├─ libs/                                 # 第三方 mod jar，如 Baritone（gitignore）
 ├─ run/<bot>/                            # bot 游戏目录（gitignore）
 └─ data/<bot>/                           # bot 数据（gitignore）
    ├─ memory/                            # 模型自管记忆
@@ -140,10 +145,16 @@ SmartWhale/
 - bridge 的 mixin 负责隐藏窗口，只在 `-Dsmartwhale.bridge.headless=true` 时生效，所以 attach 模式下的正常客户端不受影响：
   - `WindowMixin`：创建窗口时设置 `GLFW_VISIBLE=false`，并在 `updateDisplay` 后保持隐藏。
   - `GameRendererMixin`：加载 overlay 结束后取消 `GameRenderer.render`。
+  - `LevelLoadStatusManagerMixin`：进服、重生、换维度后的加载界面原本要等玩家所在区块**编译完渲染数据**才关闭；不渲染时这永远不会发生，只能等 30 秒超时。改为区块数据到达即视为就绪。
+- 隐藏窗口从不抓取鼠标，带来两个输入问题，由 `MinecraftMixin` 和 `action/InputControl` 处理：
+  - 原版每 tick 调用 `continueAttack(screen == null && keyAttack.isDown() && mouseGrabbed)`，在这里等价于 `continueAttack(false)`，会立刻中止挖掘。bridge 挖掘期间屏蔽这次调用，并在自己的 `ClientTickEvent.Pre` 里推进挖掘（这样有界面打开时也能继续）。
+  - 持续右键（吃东西、拉弓）用真实的 `keyUse.setDown(true)`，同时屏蔽原版 `startUseItem` 的重复触发。
+  - 另外因为不渲染，`mc.hitResult` 不会更新，bridge 的所有瞄准和可见性判断都用自己的射线检测。
 - launcher 往游戏目录的 `config/fml.toml` 写入 `earlyWindowControl = false`，否则 FML 的早期加载窗口会在 mod 加载之前弹出来。
 - 启动时附加的 JVM 参数：
   - `-javaagent:<authlib-injector.jar>=<yggdrasil API URL>`、`-Dauthlibinjector.side=client`
   - `-Dsmartwhale.bridge.port=<port>`、`-Dsmartwhale.bridge.token=<随机 secret>`、`-Dsmartwhale.bridge.headless=true`
+  - `-Dsmartwhale.bridge.perception=visible|omniscient`：感知模式（§6.3），由 bridge 统一执行，agent 无法绕过
   - `-Dsmartwhale.bridge.autoconnect=<host:port>`：bridge 在标题界面或断线界面自动连接服务器，失败按指数退避重试，并通过 `event.disconnect_screen` 上报断线原因。
   - `-Dstdout.encoding=UTF-8` 等：launcher 按 UTF-8 解码子进程输出。
 - launcher 接管子进程的 stdout/stderr 并写入 `data/<bot>/logs/minecraft.log`，token 会被打码。
@@ -168,7 +179,7 @@ SmartWhale/
 - WebSocket：MC 自带的 Netty 不包含 `netty-codec-http`，所以 bridge 内置一个最小的 RFC 6455 实现（阻塞 socket 加线程池），只监听 `127.0.0.1`。不引入额外依赖，也不需要 jar-in-jar。
 - 开发时可以用 `bridge/quickbuild.mjs` 直接拿实例里的 jar 跑 javac，几秒出包；Gradle 构建（ModDevGradle）用于正式产物。
 - JSON：使用 MC 自带的 Gson。
-- Baritone：以 `baritone-api-neoforge-1.11.2` 作为编译依赖，运行时把 standalone jar 放进 `mods/`。
+- Baritone：**软依赖**。`libs/baritone-api-neoforge-1.11.2.jar`（不入库）同时作为 `compileOnly` 依赖和运行时 mod，由 launcher 通过 `minecraft.mods.extra` 只放进 bot 的 `mods/`，玩家自己的实例不受影响。bridge 用 `ModList.isLoaded("baritoe")`（Baritone 的 mod id 就是这么拼的）判断；未安装时 `compat/baritone/` 下的类不会被加载，`task.*` 移动类方法返回"Baritone 未安装"的错误。
 - 只在客户端加载（`neoforge.mods.toml` 中 `side = "CLIENT"`）。
 
 ### 5.2 线程模型
@@ -187,12 +198,14 @@ SmartWhale/
 
 ### 5.4 Baritone 配置
 
-由 bridge 在启动时写入：
+由 bridge 在进入世界时写入（`compat/baritone/Bari.java`）：
 
-- `chatControl=false`、`prefixControl=false`，防止聊天内容触发 Baritone 命令。
-- `allowBreak=true`、`allowPlace=true`、`allowParkour=false`、`allowSprint=true`。
+- `chatControl=false`、`prefixControl=false`、`echoCommands=false`、`chatDebug=false`，防止聊天内容触发 Baritone 命令，也不让它往聊天栏输出。
+- `allowBreak=true`、`allowPlace=true`、`allowSprint=true`、`allowInventory=true`、`autoTool=true`、`allowParkour=false`。
 - `freeLook=false`、`antiCheatCompatibility=true`，尽量模拟正常玩家。
-- `acceptableThrowawayItems` 以泥土、圆石为主，可通过 RPC 调整。
+- 关闭所有渲染和桌面通知（`renderPath`、`renderGoal`、`renderSelectionBoxes`、`desktopNotifications`）。
+- `logger` 替换为 bridge 自己的回调：Baritone 的日志进入 bridge 日志，"寻路失败"类消息被计数，用于任务失败判定和 hint。
+- `acceptableThrowawayItems` 暂用默认值。
 
 ## 6. 通信协议（WebSocket + JSON-RPC 2.0）
 
@@ -233,19 +246,20 @@ SmartWhale/
 | 方法 | 说明 |
 |---|---|
 | `observe.status` | 名字、维度、坐标、朝向、生命/最大生命、饥饿/饱和、经验、护甲、状态效果、主手/副手物品、是否着火/在水中/在地面、群系、光照、游戏时间（含昼夜）、天气、当前任务 |
-| `observe.inventory` | 背包、快捷栏（标出选中槽位）、护甲栏、副手；如果有 Curios 槽位也一并列出 |
-| `observe.blocks { radius, filter?, mode }` | 周围方块概览：`mode=summary` 返回各类方块的计数和最近坐标，`mode=list` 返回坐标列表（有上限） |
-| `observe.find_blocks { ids/tags, radius, limit }` | 查找最近的指定方块。受**感知模式**约束（见下文） |
-| `observe.block { pos }` | 方块 id、blockstate 属性、是否有方块实体，以及容器内容（如果已缓存） |
-| `observe.entities { radius, filter? }` | 附近实体：类型、名字、距离、坐标、生命值，以及是否敌对、是否玩家 |
+| `observe.inventory` | 快捷栏（标出选中槽位）、主背包、护甲栏、副手、手上拿着的物品、各物品总数、空槽数。槽位编号沿用 `Inventory`：0–8 快捷栏、9–35 主背包、36–39 护甲（脚→头）、40 副手。Curios 槽位暂未列出 |
+| `observe.blocks { radius≤16, blocks?, mode }` | 周围方块概览：`mode=summary` 返回各类方块的计数和最近坐标，`mode=list` 返回坐标列表（有上限） |
+| `observe.find_blocks { blocks, radius≤64, limit≤64 }` | 查找最近的指定方块（`blocks` 是 id 或 `#tag` 列表）。受**感知模式**约束（见下文） |
+| `observe.block { pos }` | 方块 id、blockstate 属性、硬度、是否需要工具、是否有方块实体、是否可见、是否在触及距离内。`visible` 模式下看不见的方块拒绝查询 |
+| `observe.entities { radius, filter? }` | 附近实体：类型、名字、距离、坐标、生命值，以及是否敌对、是否玩家。`filter` 可选 `hostile`、`player`、`item`、`living` 或实体类型 id |
 | `observe.players` | 在线玩家列表（tab 列表），并标出附近的玩家 |
 | `observe.screen` | 当前打开的界面：menu 类型 id、标题、槽位（index、物品、数量、属于容器还是玩家背包）、可点击控件（index、文字、类型）、进度条类数据（ContainerData） |
 
-**感知模式**（配置项 `agent.perception`，默认 `visible`）：
+**感知模式**（配置项 `bridge.perception`，默认 `visible`，通过系统属性传给 bridge，见 §4.2）：
 
-- `visible`：`observe.blocks` 和 `observe.find_blocks` 只返回至少有一面接触空气、水或其他透明方块的方块，同时还要求与 bot 眼睛之间的射线无遮挡，或在 4 格内。效果接近真人，矿石要靠自己去找、去挖。
+- `visible`：`observe.blocks` 和 `observe.find_blocks` 只返回至少有一面不是实心不透明方块的方块，同时还要求在 4 格内，或者从 bot 眼睛到方块中心或某个外露面中心的射线无遮挡。效果接近真人，矿石要靠自己去找、去挖。
 - `omniscient`：返回客户端已加载区块中的所有匹配方块，相当于矿透。
-- `task.mine` 和 `task.goto_block` 依赖 Baritone 的方块搜索，所以在 `visible` 模式下要配置 Baritone 的 `legitMine=true`，让它只挖看得见的矿。
+- 搜索从近到远逐层扩大半径，可见性判断按距离顺序惰性执行，找够 `limit` 个就停。
+- `task.mine` 和 `task.goto_block` 选目标也走同一套感知逻辑，不使用 Baritone 的方块搜索。Baritone 的 `legitMine` 不合适：它在没有已知目标时会去 y=11 挖矿道，而且只认识触及距离内的方块。
 
 #### knowledge.*（只读，客户端本地）
 
@@ -277,18 +291,20 @@ SmartWhale/
 
 | 方法 | 说明 |
 |---|---|
-| `action.chat { message }` | 发送聊天。`/` 开头的命令只允许白名单内的（`/msg`、`/tell`、`/r`、`/me`） |
+| `action.chat { message }` | 发送聊天，最长 256 字符。`/` 开头的命令只允许白名单内的（`/msg`、`/tell`、`/w`、`/r`、`/me`） |
 | `action.look { pos \| entity_id \| yaw,pitch }` | 转向 |
 | `action.select_hotbar { slot }` | 选择快捷栏槽位 |
 | `action.equip { item, slot: mainhand\|offhand\|head\|... }` | 把背包中的物品装备到指定位置 |
 | `action.drop { item?, slot?, count }` | 丢弃物品 |
-| `action.use_item { hand, duration_ticks? }` | 右键使用物品（吃东西、拉弓、使用 mod 物品），支持持续按住 |
+| `action.use_item { hand, duration_ticks? }` | 右键使用物品（吃东西、拉弓、使用 mod 物品），支持持续按住；按住期间异步等待，结束后返回 |
 | `action.interact_block { pos, face? }` | 右键方块（开门、开箱、操作 mod 机器）；需要时自动转向，超出触及距离时报错 |
-| `action.break_block { pos }` | 挖掉单个可触及的方块（Baritone 之外的精细操作） |
-| `action.place_block { item, pos, face? }` | 在指定位置放置方块 |
+| `action.break_block { pos, auto_tool? }` | 挖掉单个可触及且可见的方块，挖完才返回。超时按预计挖掘时间的两倍计算，最长 60 秒。`auto_tool`（默认开）的选择规则见下文 |
+| `action.place_block { item, pos, against? }` | 在指定位置放置方块；`against` 指定贴着哪个相邻方块放，默认自动选 |
 | `action.interact_entity { entity_id }` | 右键实体（交易、骑乘、喂养） |
 | `action.attack { entity_id }` | 攻击一次，会考虑攻击冷却 |
 | `action.respawn` | 死亡后重生 |
+
+**自动选工具**：只有"比空手挖得快"或"该方块必须用它才有掉落"的物品才算合适的工具，挖掉落要求高于挖掘速度。没有合适工具时**切换为空手**：先找快捷栏空槽，快捷栏满了就把手上的物品换到主背包的空槽。这样不会拿着枪、食物或剑去挖方块（TACZ 的枪本身就挖不动方块）。
 
 #### menu.*（通用界面操作，可覆盖 mod GUI）
 
@@ -299,25 +315,29 @@ SmartWhale/
 | `menu.click_widget { index }` | 点击界面上的按钮控件（用于 mod GUI），控件来自 `observe.screen` |
 | `menu.craft { item \| recipe_ref, count }` | 合成：自动找配方。2x2 用背包合成格，3x3 需要已打开工作台。优先使用 JEI 转移，否则用原版 `handlePlaceRecipe` 摆好原料，然后 shift 点击取出。会循环执行直到达到 count 或原料耗尽 |
 | `menu.jei_transfer { recipe_ref, max?: bool }` | 对**当前打开的界面**执行 JEI 配方转移，相当于点击 JEI 的"+"按钮。适用于所有为 JEI 注册了 `IRecipeTransferHandler` 的 mod 机器和工作台。会先调用 `transferRecipe(..., doTransfer=false)` 检查，失败时返回 JEI 给出的错误（例如缺少原料、界面不匹配），作为 hint。转移后如何取出产物（产物槽、等待加工）由模型通过 `observe.screen` 和 `menu.click` 或 `menu.transfer` 完成 |
-| `menu.close` | 关闭当前界面 |
+| `menu.close` | 关闭当前界面（M1 已实现；其余 menu.* 在 M3） |
 
 #### task.*（长任务，异步完成）
 
-`task.*` 的启动方法立即返回 `{ task_id }`。任务完成时推送 `event.task_finished` 或 `event.task_failed`。同一时刻只能运行一个移动类任务，启动新任务会自动取消旧任务。
+`task.*` 的启动方法立即返回 `{ task_id }`。任务完成时推送 `event.task_finished` 或 `event.task_failed`。同一时刻只运行一个任务，启动新任务会取消旧任务（旧任务以 `reason=superseded` 失败）。启动时就能判断的问题（参数错误、附近没有目标）直接作为 RPC 错误返回，不创建任务。
 
-| 方法 | Baritone 映射 | 说明 |
+| 方法 | 实现 | 说明 |
 |---|---|---|
-| `task.goto { pos \| xz \| y, range? }` | `CustomGoalProcess` + `GoalBlock`/`GoalXZ`/`GoalNear` | 前往目标位置 |
-| `task.goto_block { ids/tags }` | `GetToBlockProcess` | 走到最近的某类方块旁 |
-| `task.mine { ids/tags, count }` | `MineProcess` | 挖到背包里有 count 个为止 |
-| `task.follow { entity_id \| player }` | `FollowProcess` | 跟随，直到被取消 |
-| `task.explore { origin? }` | `ExploreProcess` | 向未探索区块移动 |
-| `task.farm { range }` | `FarmProcess` | 收获并重新种植作物 |
-| `task.collect_items { radius }` | 自定义 | 捡起附近掉落物 |
+| `task.goto { pos, range? \| xz \| y }` | `CustomGoalProcess` + `GoalNear`/`GoalBlock`/`GoalXZ`/`GoalYLevel` | 前往目标位置 |
+| `task.goto_block { blocks }` | `GoalComposite`（最近 8 个可感知方块的 `GoalGetToBlock`） | 走到最近的某类方块旁 |
+| `task.mine { blocks, count, radius? }` | **自己的循环**，Baritone 只负责走路 | 挖掉 `count` 个方块（不是"背包里凑够 count 个"），默认半径 32。循环：选最近的可感知目标 → 走到可触及且可见处 → 挖 → 捡掉落物。到不了或挖不动的目标会被跳过，原因记在结果的 `skipped` 里。掉落要求特定工具而背包里没有时，以 `reason=no_tool` 失败 |
+| `task.follow { entity_id \| player, duration_s? }` | `FollowProcess` | 跟随，默认 300 秒后结束 |
+| `task.explore { origin?, duration_s? }` | `ExploreProcess` | 向未探索区块移动，默认 60 秒 |
+| `task.farm { range, duration_s? }` | `FarmProcess` | 收获并重新种植作物，默认 120 秒 |
+| `task.collect_items { radius? }` | 自定义 | 捡起附近（默认 8 格）掉落物；附近没有掉落物时直接报错 |
 | `task.status` | — | 当前任务和进度 |
 | `task.cancel` | `cancelEverything` | 取消当前任务 |
 
-任务有超时（可配置，默认 5 分钟）。另外有"卡住检测"：位置长时间不变化且 Baritone 无进展时，直接判定失败，`reason=stuck`。
+所有移动类任务都需要 Baritone（§5.1）。
+
+任务有超时（`timeout_s`，默认 5 分钟）。另外有"卡住检测"：30 秒内位置没有变化且任务没有报告进展时，判定失败，`reason=stuck`。断线或死亡也会让任务失败。
+
+结束事件统一带：`task_id`、`kind`、`elapsed_s`、`pos`、`inventory_delta`（任务期间背包变化），失败时还有 `reason` 和 `hint`，以及各任务自己的字段（如 `mined`、`requested`、`skipped`）。
 
 #### tacz.*（可选模块，仅在 `tacz` 已加载时注册）
 
@@ -349,19 +369,23 @@ TACZ 的枪械既不走原版 `attack`，也不走 `use_item`，而是由客户�
 | 通知 | 字段 | 紧急 |
 |---|---|---|
 | `event.chat` | `sender`、`sender_uuid?`、`message`、`kind: player\|system\|whisper`、`distance?`、`mentions_me` | 提到 bot 或私聊时为是 |
-| `event.hurt` | `amount`、`health`、`source?`、`attacker?` | 是 |
-| `event.death` | `message`、`pos` | 是 |
-| `event.respawned` | `pos` | — |
-| `event.task_finished` | `task_id`、`summary` | 是 |
-| `event.task_failed` | `task_id`、`reason`、`hint` | 是 |
-| `event.item_picked` | `item`、`count` | — |
-| `event.screen_opened` / `event.screen_closed` | `menu_type`、`title` | — |
+| `event.hurt` | `amount`、`health`、`source?`、`attacker?`、`attacker_id?`、`attacker_type?` | 是 |
+| `event.death` | `message?`、`pos`、`dimension` | 是 |
+| `event.respawned` | `pos`、`dimension` | — |
+| `event.dimension_changed` | `pos`、`dimension` | — |
+| `event.task_finished` | 见 §6.3 task.* | 是 |
+| `event.task_failed` | 见 §6.3 task.* | 是 |
+| `event.item_picked` | `items: [{ item, count }]` | — |
+| `event.screen_opened` / `event.screen_closed` | `class`、`title`、`menu_type?` | — |
 | `event.player_joined` / `event.player_left` | `name` | — |
 | `event.time` | `phase: dawn\|dusk` | — |
-| `event.disconnected` | `reason` | 是 |
+| `event.disconnected` | — | 是 |
+| `event.disconnect_screen` | `reason`（断线界面上的原因，由自动重连上报） | 是 |
 | `event.world_ready` | `server`、`dimension` | 是 |
 
-为了避免事件刷屏，同类低优先级事件会在 bridge 端合并（例如 1 秒内的多次拾取合成一条）。
+为了避免事件刷屏，同类低优先级事件会在 bridge 端合并：1 秒内的多次拾取合成一条 `item_picked`，0.5 秒内的多次受伤合成一条 `hurt`。玩家进出通过每秒比对 tab 列表得到。
+
+注意：bot 进服时如果上次就停在死亡界面，服务器会立刻再发一次死亡界面，因此进服后马上收到 `event.death` 是正常的。
 
 ## 7. Agent 设计
 
@@ -455,6 +479,13 @@ stateDiagram-v2
 | launch（默认） | `smartwhale run config/whale.json` | 由 launcher 完成认证、准备实例、启动客户端、自动进服；端口和 token 随机生成，通过系统属性传给 bridge |
 | attach（开发） | `smartwhale run config/whale.json --attach ws://127.0.0.1:25599 --token dev` | 不启动 MC，直接连接已经在运行的客户端（例如 IDE 的 `runClient` 带窗口，手动进服）。bridge 从 `config/smartwhale-bridge.toml` 读取固定的端口和 token。这种模式下不做认证、不做守护，断线后只重连 WS |
 
+两种模式都可以加 `--control-port <n>`，在 `127.0.0.1` 上开一个调试用的 HTTP 端点（`agent/src/bridge/control.ts`）。bridge 只允许一个连接，而 agent 占着它，所以手工调试和脚本都通过这个端点转发：
+
+- `POST /rpc {"method", "params", "timeout_ms"?}` → `{"result"}` 或 `{"error": {code, message, hint}}`
+- `GET /events?after=<seq>&wait=<秒>` → `{"events": [...], "last": seq}`，长轮询，内部保留最近 500 条事件
+
+`agent/scripts/m1-demo.ts` 就是通过它驱动 M1 验收流程的。
+
 ## 8. 配置
 
 `config/<bot>.json`，由 zod 校验。敏感信息只从环境变量读取。
@@ -470,7 +501,8 @@ stateDiagram-v2
     "jvmArgs": ["-Xmx4G"],
     "mods": {
       "source": "D:\\.minecraft\\versions\\1.21.1-NeoForge\\mods",
-      "exclude": ["sodium-*", "iris-*", "BetterF3-*", "mobhealthbar-*", "appleskin-*", "*.disabled"]
+      "exclude": ["sodium-*", "iris-*", "BetterF3-*", "mobhealthbar-*", "appleskin-*", "*.disabled"],
+      "extra": ["libs/baritone-api-neoforge-1.11.2.jar"]
     }
   },
   "auth": {
@@ -479,7 +511,7 @@ stateDiagram-v2
     "username": "whale@example.com",
     "passwordEnv": "SMARTWHALE_AUTH_PASSWORD"
   },
-  "bridge": { "port": 0 },
+  "bridge": { "port": 0, "perception": "visible" },
   "llm": {
     "baseURL": "https://api.example.com/v1",
     "model": "some-model",
@@ -489,7 +521,6 @@ stateDiagram-v2
   },
   "agent": {
     "persona": "",
-    "perception": "visible",
     "autoRespawnSeconds": 60,
     "heartbeatSeconds": 30,
     "chat": { "minIntervalSeconds": 3, "maxPerMinute": 10 },
@@ -498,7 +529,7 @@ stateDiagram-v2
 }
 ```
 
-`bridge.port = 0` 表示由 launcher 自动选一个空闲端口，并通过系统属性传给 bridge。
+`bridge.port = 0` 表示由 launcher 自动选一个空闲端口，并通过系统属性传给 bridge。`mods.extra` 里的相对路径相对仓库根目录。
 
 ## 9. 技术栈汇总
 
@@ -527,7 +558,7 @@ stateDiagram-v2
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **M0 技术验证** ✅ | 无头启动 + authlib-injector + bridge 只实现 `bridge.hello` 和 `observe.status` | Node 脚本能连上并打印 bot 在服务器中的坐标；R1 有结论 |
-| **M1 Bridge 基础** | observe.* 全部、action.* 基础部分、task.*（Baritone）、事件 | 用脚本驱动 bot 完成"走到树旁、砍 5 个原木、捡起掉落物" |
+| **M1 Bridge 基础** ✅ | observe.* 全部、action.* 基础部分、task.*（Baritone）、事件 | 用脚本驱动 bot 完成"走到树旁、砍 5 个原木、捡起掉落物"（`agent/scripts/m1-demo.ts`，空手 26 秒完成） |
 | **M2 Agent 基础** | LLM 客户端、工具注册、主循环、`wait`、聊天限流、记忆工具、转录日志 | bot 能自主行动 30 分钟以上不卡死，并能和玩家聊天 |
 | **M3 知识与界面** | knowledge.*（JEI + 原版兜底）、`knowledge.plan`、menu.*、`menu.jei_transfer`、合成、容器、mod GUI 控件 | bot 自主完成从原木到石镐；能把物品存进箱子；能查 JEI 并用厨锅做出一道 Farmer's Delight 料理 |
 | **M3.5 TACZ** | tacz.*、`task.tacz_engage`、命中反馈 | bot 持枪击杀僵尸，并能自己换弹 |
