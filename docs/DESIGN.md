@@ -245,7 +245,7 @@ SmartWhale/
 
 | 方法 | 说明 |
 |---|---|
-| `observe.status` | 名字、维度、坐标、朝向、生命/最大生命、饥饿/饱和、经验、护甲、状态效果、主手/副手物品、是否着火/在水中/在地面、群系、光照、游戏时间（含昼夜）、天气、当前任务 |
+| `observe.status` | 名字、维度、坐标、朝向、生命/最大生命、饥饿/饱和、经验、护甲、状态效果、主手/副手物品、是否着火/在水中/在地面、是否没入水中和剩余氧气（`underwater`、`air`、`max_air`，M2）、群系、光照、游戏时间（含昼夜）、天气、当前任务 |
 | `observe.inventory` | 快捷栏（标出选中槽位）、主背包、护甲栏、副手、手上拿着的物品、各物品总数、空槽数。槽位编号沿用 `Inventory`：0–8 快捷栏、9–35 主背包、36–39 护甲（脚→头）、40 副手。Curios 槽位暂未列出 |
 | `observe.blocks { radius≤16, blocks?, mode }` | 周围方块概览：`mode=summary` 返回各类方块的计数和最近坐标，`mode=list` 返回坐标列表（有上限） |
 | `observe.find_blocks { blocks, radius≤64, limit≤64 }` | 查找最近的指定方块（`blocks` 是 id 或 `#tag` 列表）。受**感知模式**约束（见下文） |
@@ -302,6 +302,7 @@ SmartWhale/
 | `action.place_block { item, pos, against? }` | 在指定位置放置方块；`against` 指定贴着哪个相邻方块放，默认自动选 |
 | `action.interact_entity { entity_id }` | 右键实体（交易、骑乘、喂养） |
 | `action.attack { entity_id }` | 攻击一次，会考虑攻击冷却 |
+| `action.eat { item?, prefer? }` | **M2**。吃东西：不指定 `item` 时从背包自动选食物（`prefer` 是优先的物品 id 列表，其次按饱和度选，避开有负面效果的食物），装到手上吃完再换回原来的手持物品。饥饿值已满且食物不能随时吃时报错 |
 | `action.respawn` | 死亡后重生 |
 
 **自动选工具**：只有"比空手挖得快"或"该方块必须用它才有掉落"的物品才算合适的工具，挖掉落要求高于挖掘速度。没有合适工具时**切换为空手**：先找快捷栏空槽，快捷栏满了就把手上的物品换到主背包的空槽。这样不会拿着枪、食物或剑去挖方块（TACZ 的枪本身就挖不动方块）。
@@ -330,6 +331,9 @@ SmartWhale/
 | `task.explore { origin?, duration_s? }` | `ExploreProcess` | 向未探索区块移动，默认 60 秒 |
 | `task.farm { range, duration_s? }` | `FarmProcess` | 收获并重新种植作物，默认 120 秒 |
 | `task.collect_items { radius? }` | 自定义 | 捡起附近（默认 8 格）掉落物；附近没有掉落物时直接报错 |
+| `task.fight { targets, roe? }` | **M2**。自己的循环，Baritone 负责追击 | 按交战规则（RoE，见下文）持续近战：选目标 → 追到触及距离 → 等冷却攻击 → 下一个。自动换上最好的近战武器。结束字段：`kills`、`hits`、`damage_taken`、`stopped_by` |
+| `task.flee { from?, distance? }` | **M2**。Baritone `GoalRunAway` | 远离威胁（默认：附近所有敌对生物；也可指定实体 id 或类型），直到与它们的距离都超过 `distance`（默认 24） |
+| `task.surface` | **M2**。自定义 | 在水中时游向最近的空气或陆地（优先陆地），到达后结束；不在水中时直接报错 |
 | `task.status` | — | 当前任务和进度 |
 | `task.cancel` | `cancelEverything` | 取消当前任务 |
 
@@ -338,6 +342,46 @@ SmartWhale/
 任务有超时（`timeout_s`，默认 5 分钟）。另外有"卡住检测"：30 秒内位置没有变化且任务没有报告进展时，判定失败，`reason=stuck`。断线或死亡也会让任务失败。
 
 结束事件统一带：`task_id`、`kind`、`elapsed_s`、`pos`、`inventory_delta`（任务期间背包变化），失败时还有 `reason` 和 `hint`，以及各任务自己的字段（如 `mined`、`requested`、`skipped`）。
+
+**`task.fight` 的交战规则（RoE）**：由模型在每次调用时给出，只对这一次调用有效，省略的字段用 bridge 默认值。没有常驻 RoE，也没有空闲时的自动反击（不设反射层，§10 R7）。字段固定，不使用表达式语言：
+
+```json
+{
+  "targets": ["minecraft:zombie", "#hostile", "player:Steve", 12345],
+  "roe": {
+    "radius": 16,
+    "leash": { "center": "start", "max_distance": 24 },
+    "retaliate": true,
+    "never_attack": ["minecraft:creeper", "#players", "minecraft:villager"],
+    "weapon": "auto",
+    "stop_if": {
+      "health_below": 8,
+      "targets_more_than": 3,
+      "seen": ["minecraft:creeper"],
+      "duration_s": 60,
+      "no_target_for_s": 5
+    },
+    "on_stop": "stand"
+  }
+}
+```
+
+| 字段 | 含义 | 默认 |
+|---|---|---|
+| `targets` | 攻击谁：实体 id、实体类型 id、tag（`#hostile` 表示所有敌对生物、`#players`）、`player:<名字>` | 必填 |
+| `radius` | 以 bot 为中心搜索目标的范围 | 16 |
+| `leash` | 追击不超过离 `center`（`"start"` 或坐标）多远 | start, 24 |
+| `retaliate` | 不在 `targets` 里、但攻击了 bot 的实体也算目标（仍受 `never_attack` 约束） | true |
+| `never_attack` | 绝不攻击的实体，优先级最高 | `["#players"]`，除非 `targets` 明确点名了某个玩家 |
+| `weapon` | `auto`（选伤害最高的近战武器，不用枪）或物品 id | auto |
+| `stop_if.health_below` | 生命低于该值时停止 | 6 |
+| `stop_if.targets_more_than` | 范围内目标数超过该值时停止 | 不限 |
+| `stop_if.seen` | 范围内出现这些实体时停止（如苦力怕） | 无 |
+| `stop_if.duration_s` | 最长交战时间 | 60 |
+| `stop_if.no_target_for_s` | 连续多久没有目标就算打完 | 5 |
+| `on_stop` | 因 `stop_if` 停止后做什么：`stand`、`flee`（转为 `task.flee`）、`{ "retreat_to": pos }` | stand |
+
+因 `stop_if` 停止时任务以 `reason=roe:<规则名>`（如 `roe:health_below`）失败；目标全部消灭或 `no_target_for_s` 到期则正常结束。
 
 #### tacz.*（可选模块，仅在 `tacz` 已加载时注册）
 
@@ -368,7 +412,7 @@ TACZ 的枪械既不走原版 `attack`，也不走 `use_item`，而是由客户�
 
 | 通知 | 字段 | 紧急 |
 |---|---|---|
-| `event.chat` | `sender`、`sender_uuid?`、`message`、`kind: player\|system\|whisper`、`distance?`、`mentions_me` | 提到 bot 或私聊时为是 |
+| `event.chat` | `sender`、`sender_uuid?`、`message`、`kind: player\|system\|whisper`、`distance?`、`mentions_me` | 提到 bot 或私聊时唤醒 `wait`，但不中断思考（§7.3） |
 | `event.hurt` | `amount`、`health`、`source?`、`attacker?`、`attacker_id?`、`attacker_type?` | 是 |
 | `event.death` | `message?`、`pos`、`dimension` | 是 |
 | `event.respawned` | `pos`、`dimension` | — |
@@ -391,10 +435,25 @@ TACZ 的枪械既不走原版 `attack`，也不走 `use_item`，而是由客户�
 
 ### 7.1 LLM 客户端
 
-- 自己封装 OpenAI 兼容的 `POST {baseURL}/chat/completions`，包括 `tools`、`tool_choice`、`parallel_tool_calls`，不依赖 SDK。
-- 配置项：`baseURL`、`model`、`apiKey`（从环境变量读取）、`temperature`、`max_tokens`、`context_window`。
-- 重试：对 429 和 5xx 做指数退避；工具调用参数不是合法 JSON 时，把错误作为工具结果回传给模型，让它自己修正。
-- 计费：记录每次调用的 token 用量。可配置每分钟调用上限和每日 token 预算，超出后进入低频模式。
+- 只支持 **OpenAI 兼容**的 `POST {baseUrl}/chat/completions`（DeepSeek、各类中转），自己用 `fetch` 封装，不依赖 SDK。使用 `tools`，**流式**（`stream: true`，带 `stream_options.include_usage`）读取，以便随时中断（§7.3）。
+- 配置来自单独的 `config/llm.json`（不入库），字段见 §8：
+
+  | 字段 | 用途 |
+  |---|---|
+  | `baseUrl`（也接受 `baseURL`）、`apiKey`（或 `apiKeyEnv`）、`model` | 连接 |
+  | `contextWindow` | 硬上限：任何请求都不得超过（§7.5） |
+  | `practicalContextWindow` | 超过后触发上下文压缩（§7.5） |
+  | `outputlength` | `max_tokens` 的上限；每轮实际请求 `min(agent.maxTokensPerTurn, outputlength)` |
+  | `averageTts` | 平均输出速度（token/秒），用于估算一轮耗时，写进日志 |
+  | `thinking` | 模型会输出 `reasoning_content`；agent 单独解析并保存 |
+  | `reasoning` | `echo`（默认）或 `drop`：完整轮次的思考内容是否作为 `reasoning_content` 回传给 API |
+  | `vision` | M2 不用（感知是纯文本）；以后可选“按需渲染一帧截图”（§12） |
+  | `fillInMiddle` | agent 不用 |
+  | `temperature` | 可选 |
+
+- **思考内容**：流式响应里的 `reasoning_content` 单独收集，写进转录日志。完整轮次按 `llm.reasoning` 处理；已实测 DeepSeek 接受带或不带 `reasoning_content` 的 assistant 消息。请求被**中断**时，已经收到的部分思考和正文总是作为一条 assistant 消息留在会话里（标注 `[interrupted]`；`echo` 时思考放在 `reasoning_content`，`drop` 时并入正文），模型下一轮能接着之前的思路。
+- 重试：对 429、5xx 和网络错误做指数退避（最多 5 次）；工具调用参数不是合法 JSON 或不符合 schema 时，把错误作为工具结果回传给模型，让它自己修正。
+- 用量：记录每次调用的输入、输出、缓存命中 token 和耗时，写进转录日志并定期汇总到控制台。**不设预算上限**。
 
 ### 7.2 工具
 
@@ -403,7 +462,9 @@ TACZ 的枪械既不走原版 `attack`，也不走 `use_item`，而是由客户�
 1. **游戏工具**：基本一一对应 §6.3 的方法（不暴露 `bridge.*`），名称用下划线风格，如 `observe_status`、`task_mine`、`menu_craft`。返回结果是**精简过的文本或 JSON**，超过 4k 字符会截断，并提示用过滤参数缩小范围。
 2. **记忆工具**：见 §7.4。
 3. **控制工具**：
-   - `wait { seconds, until?: "task" | "event" }`：暂停思考，直到超时、当前任务结束或紧急事件到来，返回期间收到的事件摘要。这是 agent 节省 token 的主要手段。
+   - `wait { until: "task_done" | "event", max_seconds }`：阻塞，直到当前任务结束（`task_done`）、任意唤醒事件到来（`event`；紧急事件和提到 bot 的聊天在两种模式下都会唤醒），或超时；返回期间收到的事件摘要。主循环不停歇（§7.3），长任务期间不调 `wait` 就会反复轮询，所以 `wait` 是节省 token 的主要手段，提示词里会强调。
+
+**高层工具优先**：不设反射层，所有反应都由模型做出（§10 R7）。为了让模型在危险时少走几步，M2 在 bridge 新增 `task.fight`（带 RoE）、`task.flee`、`task.surface` 和 `action.eat`（§6.3），一次调用就能完成一整段战斗、逃跑、出水或进食。
 
 工具执行失败（bridge 错误、超时）时，不抛异常，而是作为工具结果返回 `{ error, hint }`。
 
@@ -415,20 +476,26 @@ stateDiagram-v2
   Booting --> Thinking: world_ready
   Thinking --> Acting: 模型返回 tool_calls
   Acting --> Thinking: 工具结果追加到上下文
-  Thinking --> Idle: 模型不调用工具（结束本轮）
+  Thinking --> Thinking: 模型不调用工具（本轮结束，立即开始下一轮）
+  Thinking --> Thinking: 紧急事件（中断流式请求，保留已生成部分）
   Acting --> Waiting: 调用 wait
-  Waiting --> Thinking: 超时 / 任务结束 / 紧急事件
-  Idle --> Thinking: 心跳(默认 30s) / 紧急事件
-  Thinking --> Compacting: 上下文超阈值
+  Waiting --> Thinking: 超时 / 任务结束 / 唤醒事件
+  Thinking --> Compacting: 超过 practicalContextWindow
   Compacting --> Thinking
   Thinking --> Booting: disconnected
 ```
 
-- **每轮开头**：自动注入一条简短的 `[状态]` 用户消息，包含坐标、生命、饥饿、时间、当前任务，以及自上一轮以来的事件。这样模型不用每轮都调 `observe_status`。
-- **事件调度**：紧急事件（§6.4）会立即唤醒 `Waiting` 和 `Idle` 状态；其余事件进入队列，在下一轮统一注入。
-- **聊天限流**：同一时间间隔内的发言条数和每分钟发言总数都有上限，超长消息自动切分（MC 单条上限 256 字符），并忽略自己发出的消息。超过限流时，`action_chat` 返回错误，让模型自己调整。
+- **不停歇循环**：没有心跳和空闲状态，一轮结束就立即开始下一轮；只有 `wait` 会让 agent 停下来。两轮之间至少间隔 1 秒，防止出错时空转。
+- **每轮开头**：自动注入一条简短的 `[status]` 用户消息，包含坐标、生命、饥饿、没入水中时的氧气、时间和天气、手持物品、当前任务，以及自上一轮以来的事件。这样模型不用每轮都调 `observe_status`。
+- **事件调度**：
+  - **紧急事件**（`event.hurt`、`event.death`、`event.disconnected`、`event.task_finished`/`task_failed` 等，见 §6.4；模型自己取消或替换的任务除外）：模型正在思考时**立即中断**流式请求，已生成的思考和正文留在会话里（§7.1），带着事件开始新一轮；在 `wait` 中则立即唤醒。为了避免连续受伤时永远想不完，**因中断而开始的一轮只会再被死亡或断线中断**，期间的 `hurt` 进入队列。
+  - **聊天唤醒**：只有提到 bot（名字或 `agent.aliases` 中的别名，不区分大小写）或私聊才唤醒 `wait`；不中断正在进行的思考，下一轮注入。其他聊天进入队列，下一轮一起注入。bot 自己发出的消息忽略。
+  - 其余事件进入队列，在下一轮统一注入；同类事件合并（如多次拾取）。
+- **聊天**：**不限流**。只检查 MC 单条 256 字符的上限：超长消息直接拒绝并返回错误，由模型自己缩短（bridge 的 `action.chat` 已经这样做）。
+- **语言**：系统提示和工具描述用英文；聊天时跟随对方使用的语言；人设（`agent.persona`）可以用任何语言写。
 - **断线**：断线时进入 `Booting`，由 supervisor 重连或重启 MC。
-- **死亡**：`event.death` 会立即唤醒模型，让它先看死亡信息、视需要把教训写进记忆，然后调用 `action_respawn`。如果超过 `agent.autoRespawnSeconds`（默认 60s）还没有重生，就由 agent 自动重生，并在下一轮注入一条说明。
+- **死亡**：收到 `event.death` 后 agent **立即自动重生**，然后把死亡信息（位置、死亡消息、重生点）作为紧急事件通知模型，让它视需要把教训写进记忆、决定是否回去捡东西。
+- **玩家建筑**：只靠提示词引导：不要拆看起来是玩家放置的方块（结构中的木板、门、玻璃、台阶等），砍树前确认是自然生成的树；玩家抱怨时把教训写进记忆。
 - **工具引导**：`menu_click` 等底层工具也暴露给模型，但它们的描述会写明"仅在 `menu_transfer`、`menu_craft`、`menu_click_widget` 无法完成时使用"。
 
 ### 7.4 记忆：模型自管文件系统
@@ -452,17 +519,20 @@ stateDiagram-v2
 
 ### 7.5 上下文管理
 
-- 每次调用前估算 token 数。
-- 达到 `context_window × 70%` 时，注入一条系统消息："上下文即将压缩，请把需要长期保留的信息写入记忆。"给模型一轮机会去调用记忆工具。
-- 达到 `× 80%` 时执行压缩：保留系统提示和最近 N 轮，把更早的消息交给 LLM 摘要成一条 `[此前经过]` 消息。
-- 工具结果也会老化：较早的大块观察结果（方块列表、界面槽位）替换为一行摘要。
+在 M2 实现。token 数以上一次响应返回的 `usage.prompt_tokens` 为准，加上之后新增消息的估算。
+
+- **只在超过 `llm.practicalContextWindow` 时压缩**，没有提前的阈值：
+  1. 超过后先注入一条系统消息："Context is about to be compacted; save anything worth keeping to memory now."，给模型一轮机会调用记忆工具；
+  2. 下一轮开始前执行压缩：保留系统提示和最近 20 条消息（不拆开 tool_call 和它的结果），把更早的消息连同上一次的 `[Story so far]` 一起交给同一个 LLM，摘要成一条新的 `[Story so far]` 消息（约 2k token，保留当前目标与计划、重要地点坐标、拥有和存放的物品、遇到的人、承诺、危险和教训）。摘要失败时退化为直接丢弃最早的消息。
+- **`llm.contextWindow` 是硬上限**：发送前如果估算会超过它（例如一轮里连续调用了很多大块观察工具），就跳过"先存记忆"这一步立即压缩；仍然超过就从最早的消息开始丢弃，保证请求不超限。
+- 工具结果也会老化：超过 10 轮的大块观察结果（方块列表、界面槽位、实体列表、背包）替换为一行摘要，减缓上下文增长。老化按批进行，尽量少破坏服务商的前缀缓存。
 
 ### 7.6 系统提示组成
 
 1. 身份与世界说明：你是一个 Minecraft 玩家，在一个装了 mod 的服务器上，只能通过工具感知和行动。
 2. 自主性：没有人给你下任务，你自己决定想做什么；其他玩家的话是社交互动，不是命令。
-3. 人设：配置项 `persona`，可选。
-4. 行为准则：遇到未知 mod 物品先查 `knowledge_*`（`knowledge_item` 看说明，`knowledge_recipes` 看怎么做，`knowledge_plan` 规划整棵合成树）；操作 mod 机器时先 `menu_jei_transfer`；长任务用 `task_*` 加 `wait`；失败时读 `hint`；保持记忆整洁。
+3. 人设：配置项 `agent.persona`，一段直接写在 bot 配置里的字符串，可选。
+4. 行为准则：危险时优先用高层工具（`task_fight` 并写好 RoE、`task_flee`、`task_surface`、`action_eat`）；不拆玩家建筑（§7.3）；遇到未知 mod 物品先查 `knowledge_*`（`knowledge_item` 看说明，`knowledge_recipes` 看怎么做，`knowledge_plan` 规划整棵合成树）；操作 mod 机器时先 `menu_jei_transfer`；长任务用 `task_*` 加 `wait`；失败时读 `hint`；保持记忆整洁。
 5. 记忆目录树和 `index.md`。
 6. 已加载的 mod 列表（名称和版本），来自 `bridge.hello`。
 
@@ -470,7 +540,7 @@ stateDiagram-v2
 
 - `data/<bot>/logs/transcript-<session>.jsonl`：完整记录每次 LLM 请求、响应、工具调用和结果，以及事件。
 - `data/<bot>/logs/minecraft.log`：MC 进程的 stdout/stderr。
-- 控制台日志使用 pino，带等级。
+- 控制台日志使用自带的轻量 logger（`agent/src/util/log.ts`），带等级。
 
 ### 7.8 运行模式
 
@@ -512,24 +582,37 @@ stateDiagram-v2
     "passwordEnv": "SMARTWHALE_AUTH_PASSWORD"
   },
   "bridge": { "port": 0, "perception": "visible" },
-  "llm": {
-    "baseURL": "https://api.example.com/v1",
-    "model": "some-model",
-    "apiKeyEnv": "SMARTWHALE_LLM_API_KEY",
-    "contextWindow": 128000,
-    "temperature": 0.7
-  },
+  "llm": "config/llm.json",
   "agent": {
-    "persona": "",
-    "autoRespawnSeconds": 60,
-    "heartbeatSeconds": 30,
-    "chat": { "minIntervalSeconds": 3, "maxPerMinute": 10 },
-    "budget": { "maxCallsPerMinute": 20, "dailyTokens": 5000000 }
+    "persona": "你是一条蓝色的大肥鱼，最爱吃白饭。",
+    "aliases": ["鲸鱼"],
+    "maxTokensPerTurn": 8192
   }
 }
 ```
 
 `bridge.port = 0` 表示由 launcher 自动选一个空闲端口，并通过系统属性传给 bridge。`mods.extra` 里的相对路径相对仓库根目录。
+
+`llm` 可以是一个文件路径（相对仓库根目录），也可以直接内联同样的对象。LLM 配置单独放在 `config/llm.json`，不入库，多个 bot 可以共用：
+
+```json
+{
+  "baseUrl": "https://api.deepseek.com",
+  "apiKey": "sk-...",
+  "model": "deepseek-flash",
+  "averageTts": 250,
+  "contextWindow": 1024000,
+  "practicalContextWindow": 272000,
+  "outputlength": 384000,
+  "vision": true,
+  "thinking": true,
+  "fillInMiddle": true,
+  "reasoning": "echo",
+  "temperature": 0.7
+}
+```
+
+各字段含义见 §7.1。`apiKey` 也可以改用 `apiKeyEnv` 指定环境变量名；`reasoning`、`temperature` 可省略。
 
 ## 9. 技术栈汇总
 
@@ -538,7 +621,7 @@ stateDiagram-v2
 | MC 端构建 | Gradle + ModDevGradle，Java 21（`D:\Applications\JDK21`） |
 | MC 端依赖 | NeoForge 21.1.252，Baritone API 1.11.2（neoforge），Gson（MC 自带）；TACZ 1.1.8、JEI 19.x API（均为 `compileOnly`，可选） |
 | Node 端 | Node ≥ 22，TypeScript（ESM，strict），npm |
-| Node 依赖 | `ws`、`zod`（v4，自带 JSON Schema 导出）、`pino`、`vitest`（测试）；HTTP 用原生 `fetch` |
+| Node 依赖 | `ws`、`zod`（v4，自带 JSON Schema 导出）；测试用 `node:test`；HTTP 用原生 `fetch` |
 | 无头启动 | 自写启动器 + 隐藏窗口 mixin（真实 LWJGL/GL） |
 | 认证 | authlib-injector，Yggdrasil authserver API |
 
@@ -550,8 +633,9 @@ stateDiagram-v2
 | R2 | 其他 mod 在跳过渲染后出问题（YSM、TACZ 已在隐藏窗口方案下实测可用） | 逐个排查；需要时在 bridge 里加 mixin，或从 bot 的 mod 列表中去掉 |
 | R3 | Baritone 对 mod 方块（非完整碰撞箱、自定义流体）判断错误 | 通过卡住检测和失败 hint 让 LLM 绕开；必要时给 Baritone 配置 `blocksToAvoid` |
 | R4 | 无头模式下 `Screen` 的 `init` 依赖渲染资源 | GL 上下文是真实的，`init` 照常执行；控件列表在 `init` 后读取 |
-| R5 | LLM 成本和延迟 | 依靠 `wait`、心跳、工具结果老化、预算限制 |
+| R5 | LLM 成本和延迟 | 依靠 `wait`、工具结果老化、前缀缓存；只记录用量，不设预算 |
 | R6 | 服务器反作弊 | Baritone 的 `antiCheatCompatibility`，禁用 parkour 和 freeLook，动作频率限流 |
+| R7 | 没有反射层，模型反应慢（思考数秒），可能淹死或被围殴 | 紧急事件中断思考；高层工具（`task.fight` + RoE、`task.flee`、`task.surface`、`action.eat`）让一次调用就能应对；状态里显示氧气 |
 
 ## 11. 里程碑
 
@@ -559,10 +643,10 @@ stateDiagram-v2
 |---|---|---|
 | **M0 技术验证** ✅ | 无头启动 + authlib-injector + bridge 只实现 `bridge.hello` 和 `observe.status` | Node 脚本能连上并打印 bot 在服务器中的坐标；R1 有结论 |
 | **M1 Bridge 基础** ✅ | observe.* 全部、action.* 基础部分、task.*（Baritone）、事件 | 用脚本驱动 bot 完成"走到树旁、砍 5 个原木、捡起掉落物"（`agent/scripts/m1-demo.ts`，空手 26 秒完成） |
-| **M2 Agent 基础** | LLM 客户端、工具注册、主循环、`wait`、聊天限流、记忆工具、转录日志 | bot 能自主行动 30 分钟以上不卡死，并能和玩家聊天 |
+| **M2 Agent 基础** | Agent：OpenAI 兼容流式客户端（可中断）、工具注册、不停歇主循环、`wait`、事件调度、记忆工具、上下文压缩、自动重生、转录日志。Bridge：`task.fight`（RoE）、`task.flee`、`task.surface`、`action.eat`，`observe.status` 增加氧气 | bot 能自主行动 30 分钟以上不卡死，并能和玩家聊天 |
 | **M3 知识与界面** | knowledge.*（JEI + 原版兜底）、`knowledge.plan`、menu.*、`menu.jei_transfer`、合成、容器、mod GUI 控件 | bot 自主完成从原木到石镐；能把物品存进箱子；能查 JEI 并用厨锅做出一道 Farmer's Delight 料理 |
 | **M3.5 TACZ** | tacz.*、`task.tacz_engage`、命中反馈 | bot 持枪击杀僵尸，并能自己换弹 |
-| **M4 健壮性** | 上下文压缩、断线重连、MC 崩溃重启、死亡处理、预算 | 连续运行 24 小时 |
+| **M4 健壮性** | 断线重连、MC 崩溃重启 | 连续运行 24 小时 |
 | **M5 评估** | 指标（存活时长、科技进度、token 成本），提示词迭代 | — |
 
 ## 12. 待决问题
@@ -570,7 +654,18 @@ stateDiagram-v2
 已决议：
 
 - 感知模式可配置，默认 `visible`（§6.3）。
-- 死亡交给模型处理，超时兜底自动重生（§7.3）。
+- 死亡后 agent 立即自动重生，再通知模型（§7.3）。
+- 不设反射层，纯 LLM 控制；危险情况靠高层工具和中断思考应对（§7.2、§10 R7）。
+- `task.fight` 的 RoE 由模型每次调用时给出，字段固定，无常驻 RoE（§6.3）。
+- LLM：只支持 OpenAI 兼容接口，自写流式客户端；紧急事件中断思考并保留部分输出（§7.1、§7.3）。
+- 聊天：提到 bot 或私聊才唤醒；不限流，超过 256 字符直接拒绝（§7.3）。
+- 记忆：模型自管的 Markdown 文件沙箱（§7.4）；上下文只在超过 `practicalContextWindow` 时压缩，`contextWindow` 为硬上限（§7.5）。
+- 不设预算，只记录用量（§7.1）。
+- 系统提示和工具描述用英文；人设是 bot 配置里的字符串（§7.3、§7.6）。
+
+以后可选：
+
+- 视觉：按需渲染一帧截图给支持 vision 的模型（M2 不做，感知是纯文本）。
 - 底层 `menu.click` 也暴露给模型，提示词引导优先使用高层工具（§7.3）。
 - 支持 attach 模式（§7.8）。
 - TACZ 提供专用工具，作为可选模块（§6.3 tacz.*）。
